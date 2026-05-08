@@ -1,3 +1,5 @@
+const SERVER_DEBUG = process.env.NODE_ENV !== 'production';
+
 import express from 'express';
 import { z } from 'zod';
 import { supabase } from '../supabase.js';
@@ -139,7 +141,7 @@ router.put('/', async (req, res, next) => {
     }
     const { channel_id, folders } = parsed.data;
 
-    console.log('[folders] sync request accepted', summarizeFoldersPayload(parsed.data));
+    if (SERVER_DEBUG) console.log('[folders] sync request accepted', summarizeFoldersPayload(parsed.data));
 
     const access = await loadAccess(req.user.user_id);
     if (!access.allowed_channels.includes(channel_id)) {
@@ -229,3 +231,4 @@ router.delete('/:id', async (req, res, next) => {
 });
 
 export default router;
+

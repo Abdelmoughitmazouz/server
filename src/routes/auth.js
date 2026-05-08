@@ -1,3 +1,5 @@
+const SERVER_DEBUG = process.env.NODE_ENV !== 'production';
+
 import express from 'express';
 import { z } from 'zod';
 import { supabase } from '../supabase.js';
@@ -63,7 +65,7 @@ router.post('/exchange', async (req, res, next) => {
       });
     }
 
-    console.log('[auth] exchange request accepted', {
+    if (SERVER_DEBUG) console.log('[auth] exchange request accepted', {
       source: extracted.source,
       bodyKeys: Object.keys(req.body || {}),
       hasAuthorizationHeader: !!req.headers.authorization,
@@ -157,3 +159,4 @@ router.post('/logout', async (req, res, next) => {
 });
 
 export default router;
+
