@@ -12,6 +12,8 @@ function required(name) {
 const DEFAULT_ALLOWED_ORIGINS = [
   'https://folder-tube.vercel.app',
   'https://foldertube.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:3000',
 ];
 
 function parseOrigins(value) {
@@ -32,5 +34,6 @@ export const config = {
   ])),
   accessTokenTtl: '15m',
   refreshTokenTtl: '30d',
-  minExtensionVersion: process.env.MIN_EXTENSION_VERSION || '1.0.9',
+  minExtensionVersion: process.env.MIN_EXTENSION_VERSION || '1.0.7',
+  devTokenEnabled: process.env.DEV_TOKEN_ENABLED === 'true',
 };

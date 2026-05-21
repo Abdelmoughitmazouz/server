@@ -5,13 +5,26 @@ import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
 
+const BASE_COLS   = 'id, email, plan, allowed_channels, primary_channel_id, channels_limit';
+const EXTRA_COLS  = 'name, subscription_expires_at, subscribed_at';
+
 router.get('/', requireAuth, async (req, res, next) => {
   try {
-    const { data, error } = await supabase
+    // Try extended select first; gracefully fall back if columns don't exist yet.
+    let { data, error } = await supabase
       .from('users')
-      .select('id, email, plan, allowed_channels, primary_channel_id, channels_limit')
+      .select(`${BASE_COLS}, ${EXTRA_COLS}`)
       .eq('id', req.user.user_id)
       .maybeSingle();
+
+    if (error) {
+      ({ data, error } = await supabase
+        .from('users')
+        .select(BASE_COLS)
+        .eq('id', req.user.user_id)
+        .maybeSingle());
+    }
+
     if (error) return next(Object.assign(new Error('profile_lookup_failed'), { status: 500 }));
 
     const profile = data || {
