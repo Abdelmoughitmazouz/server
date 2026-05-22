@@ -169,8 +169,10 @@ export async function getSubscriptionsFingerprint(userId, { force = false } = {}
   }
 
   const credentials = await loadGoogleProviderTokens(userId);
+  console.log('[FolderTube Server] Google provider token found:', !!credentials?.accessToken);
   if (!credentials?.accessToken) throw googleProviderTokenMissing();
 
+  console.log('[FolderTube Server] YouTube Data API validation started');
   let channelIds;
   try {
     channelIds = await fetchYoutubeChannelIds(credentials.accessToken);

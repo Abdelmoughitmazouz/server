@@ -4,6 +4,7 @@ import { supabase } from '../supabase.js';
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../jwt.js';
 import { saveGoogleProviderTokens } from '../google-provider-tokens.js';
 import { invalidateSubscriptionsFingerprintCache } from '../youtube-subscriptions.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -14,6 +15,9 @@ const exchangeBodySchema = z.object({
   provider_token: z.string().min(10).optional(),
   provider_refresh_token: z.string().min(10).optional(),
   provider_token_expires_at: z.union([z.string().datetime(), z.number()]).optional(),
+}).passthrough();
+const storeGoogleTokenSchema = z.object({
+  provider_token: z.string().min(10),
 }).passthrough();
 
 function extractSupabaseAccessToken(req) {
@@ -96,6 +100,8 @@ router.post('/exchange', async (req, res, next) => {
         provider_token: body.data.provider_token,
         provider_refresh_token: body.data.provider_refresh_token || null,
         provider_token_expires_at: tokenExpiry(body.data.provider_token_expires_at),
+        email: profile.email || data.user.email || null,
+        primary_channel_id: profile.primary_channel_id || null,
       });
       if (savedProviderToken) {
         await invalidateSubscriptionsFingerprintCache(profile.id);
@@ -110,6 +116,25 @@ router.post('/exchange', async (req, res, next) => {
     const { token: refresh_token } = signRefreshToken({ user_id: profile.id });
 
     res.json({ access_token, refresh_token, profile });
+  } catch (e) { next(e); }
+});
+
+router.post('/store-google-token', requireAuth, async (req, res, next) => {
+  try {
+    const parsed = storeGoogleTokenSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'bad_request', detail: parsed.error.issues });
+    }
+
+    const profile = await loadProfile(req.user.user_id, req.user);
+    await saveGoogleProviderTokens(profile.id, {
+      provider_token: parsed.data.provider_token,
+      email: profile.email || req.user.email || null,
+      primary_channel_id: profile.primary_channel_id || null,
+    });
+    await invalidateSubscriptionsFingerprintCache(profile.id);
+
+    return res.json({ ok: true });
   } catch (e) { next(e); }
 });
 

@@ -24,6 +24,7 @@ npm run dev
 | Method | Path | Auth | Body | Returns |
 |---|---|---|---|---|
 | POST | `/api/auth/exchange` | `Bearer <supabase_access_token>` or body token | Supabase token plus optional `{provider_token, provider_refresh_token}` from the Google OAuth session | `{access_token, refresh_token, profile}` |
+| POST | `/api/auth/store-google-token` | `Bearer <access_token>` | `{provider_token}` | `{ok:true}` |
 | POST | `/api/auth/refresh`  | — | `{refresh_token}` | `{access_token, refresh_token}` (rotated) |
 | POST | `/api/auth/logout`   | — | `{refresh_token}` | 204 |
 | GET  | `/api/me`            | `Bearer <access_token>` | — | `{profile, min_extension_version}` |

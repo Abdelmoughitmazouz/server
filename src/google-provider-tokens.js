@@ -38,6 +38,8 @@ export async function saveGoogleProviderTokens(userId, tokens) {
 
   const row = {
     user_id: userId,
+    email: tokens.email || null,
+    primary_channel_id: tokens.primary_channel_id || null,
     access_token_ciphertext: encrypt(tokens.provider_token),
     access_token_expires_at: tokens.provider_token_expires_at || null,
     updated_at: new Date().toISOString(),
