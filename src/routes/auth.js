@@ -2,6 +2,8 @@ import express from 'express';
 import { z } from 'zod';
 import { supabase } from '../supabase.js';
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../jwt.js';
+import { saveGoogleProviderTokens } from '../google-provider-tokens.js';
+import { invalidateSubscriptionsFingerprintCache } from '../youtube-subscriptions.js';
 
 const router = express.Router();
 
@@ -9,6 +11,9 @@ const exchangeBodySchema = z.object({
   access_token: z.string().min(10).optional(),
   supabase_access_token: z.string().min(10).optional(),
   token: z.string().min(10).optional(),
+  provider_token: z.string().min(10).optional(),
+  provider_refresh_token: z.string().min(10).optional(),
+  provider_token_expires_at: z.union([z.string().datetime(), z.number()]).optional(),
 }).passthrough();
 
 function extractSupabaseAccessToken(req) {
@@ -48,6 +53,11 @@ async function loadProfile(user_id, fallbackUser) {
   };
 }
 
+function tokenExpiry(value) {
+  if (typeof value === 'number') return new Date(value * 1000).toISOString();
+  return value || null;
+}
+
 router.post('/exchange', async (req, res, next) => {
   try {
     const extracted = extractSupabaseAccessToken(req);
@@ -80,6 +90,18 @@ router.post('/exchange', async (req, res, next) => {
     }
 
     const profile = await loadProfile(data.user.id, data.user);
+    const body = exchangeBodySchema.safeParse(req.body || {});
+    if (body.success && body.data.provider_token) {
+      const savedProviderToken = await saveGoogleProviderTokens(profile.id, {
+        provider_token: body.data.provider_token,
+        provider_refresh_token: body.data.provider_refresh_token || null,
+        provider_token_expires_at: tokenExpiry(body.data.provider_token_expires_at),
+      });
+      if (savedProviderToken) {
+        await invalidateSubscriptionsFingerprintCache(profile.id);
+      }
+    }
+
     const access_token = signAccessToken({
       user_id: profile.id,
       email: profile.email,

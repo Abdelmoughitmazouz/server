@@ -36,4 +36,7 @@ export const config = {
   refreshTokenTtl: '30d',
   minExtensionVersion: process.env.MIN_EXTENSION_VERSION || '1.0.7',
   devTokenEnabled: process.env.DEV_TOKEN_ENABLED === 'true',
+  googleOauthClientId: process.env.GOOGLE_OAUTH_CLIENT_ID || '',
+  googleOauthClientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET || '',
+  googleTokenEncryptionKey: process.env.GOOGLE_TOKEN_ENCRYPTION_KEY || process.env.JWT_SECRET,
 };
