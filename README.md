@@ -12,7 +12,7 @@ Fill in:
 - `SUPABASE_SERVICE_ROLE_KEY` — Supabase dashboard → Project Settings → API → `service_role` key (do NOT commit)
 - `JWT_SECRET` — generate with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`
 
-Run the migration in `migrations/001_revoked_tokens.sql` against the Supabase project (SQL Editor).
+Run the migrations in `migrations/` against the Supabase project (SQL Editor).
 
 ```
 npm install
@@ -27,6 +27,7 @@ npm run dev
 | POST | `/api/auth/refresh`  | — | `{refresh_token}` | `{access_token, refresh_token}` (rotated) |
 | POST | `/api/auth/logout`   | — | `{refresh_token}` | 204 |
 | GET  | `/api/me`            | `Bearer <access_token>` | — | `{profile, min_extension_version}` |
+| POST | `/api/me/validate-youtube-context` | `Bearer <access_token>` | `{currentSubscriptions: ["UC..."]}` | `{ok: true}` or `{ok: false, reason: "youtube_account_mismatch"}` |
 | GET  | `/api/folders?channel_id=...` | `Bearer <access_token>` | — | `{folders: [...]}` |
 | PUT  | `/api/folders`       | `Bearer <access_token>` | `{channel_id, folders[]}` | `{folders, deleted_ids}` or 403 `folder_limit_exceeded` |
 | DELETE | `/api/folders/:id` | `Bearer <access_token>` | — | 204 / 404 |
@@ -81,7 +82,9 @@ Channel slots are enforced when a channel is linked (handled by the website). Th
 2. **Channel membership:** `channel_id` must be in the user's `allowed_channels` (merged with legacy `primary_channel_id`). Read fresh from `users` on every request, never the JWT. If not linked, returns `403 channel_not_linked` with `{plan, allowed_channels, channels_limit}` so the client can render an actionable error.
 3. **Folder count** (PUT only): `folders.length` ≤ `PLAN_LIMITS[plan].folders_per_workspace`. If exceeded, returns `403 folder_limit_exceeded` with `{plan, limit, attempted}`. The existing Supabase `folder_limit_exceeded` trigger is left in place as a backstop.
 
-**`user_id` is always taken from the JWT**, never from the request body — a client cannot write folders for another user regardless of what it sends. The server cannot verify YouTube channel ownership; trust is anchored on the channel having been linked through the website's auth flow.
+**`user_id` is always taken from the JWT**, never from the request body — a client cannot write folders for another user regardless of what it sends.
+
+`POST /api/me/validate-youtube-context` is the folder-load guard. The extension sends channel IDs from its authenticated YouTube subscription fetch, not a page or account-menu channel ID. The server matches that context against rows in `youtube_context_snapshots` that were seeded by a trusted link/verification flow. During rollout it also checks channel IDs already stored in that user's folder metadata as a legacy subscription snapshot. Fewer than three matching known subscriptions is a fail-closed `{ok:false, reason:"youtube_account_mismatch"}` response; the client must not load or sync folders until it receives `{ok:true}`.
 
 `GET /api/folders` without a `channel_id` returns folders only for channels in `allowed_channels` (so historical rows from an unlinked channel are not leaked).
 
