@@ -18,6 +18,20 @@ function googleReauthRequired() {
   });
 }
 
+function googleProviderTokenMissing() {
+  return Object.assign(new Error('google_provider_token_missing'), {
+    status: 200,
+    reason: 'google_provider_token_missing',
+  });
+}
+
+function youtubeApiAuthFailed() {
+  return Object.assign(new Error('youtube_api_auth_failed'), {
+    status: 200,
+    reason: 'youtube_api_auth_failed',
+  });
+}
+
 function isCacheFresh(cachedAt) {
   const time = Date.parse(cachedAt || 0);
   return Number.isFinite(time) && Date.now() - time < CACHE_TTL_MS;
@@ -134,7 +148,7 @@ async function fetchYoutubeChannelIds(accessToken) {
     if (!response) throw Object.assign(new Error('youtube_subscriptions_fetch_failed'), { status: 502 });
     if (!response.ok) {
       throw Object.assign(new Error('youtube_subscriptions_fetch_failed'), {
-        status: response.status === 401 ? 401 : 502,
+        status: response.status,
         youtubeStatus: response.status,
       });
     }
@@ -155,18 +169,21 @@ export async function getSubscriptionsFingerprint(userId, { force = false } = {}
   }
 
   const credentials = await loadGoogleProviderTokens(userId);
-  if (!credentials?.accessToken) throw googleReauthRequired();
+  if (!credentials?.accessToken) throw googleProviderTokenMissing();
 
   let channelIds;
   try {
     channelIds = await fetchYoutubeChannelIds(credentials.accessToken);
   } catch (error) {
+    if (error.youtubeStatus === 403) throw youtubeApiAuthFailed();
     if (error.status !== 401) throw error;
     const accessToken = await refreshGoogleAccessToken(userId, credentials.refreshToken);
     try {
       channelIds = await fetchYoutubeChannelIds(accessToken);
     } catch (refreshedError) {
-      if (refreshedError.status === 401) throw googleReauthRequired();
+      if (refreshedError.status === 401 || refreshedError.youtubeStatus === 403) {
+        throw youtubeApiAuthFailed();
+      }
       throw refreshedError;
     }
   }

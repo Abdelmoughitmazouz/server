@@ -130,9 +130,15 @@ router.get('/', requireAuth, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-function returnGoogleReauth(res, error) {
-  if (error?.reason !== 'google_reauth_required') return false;
-  res.json({ ok: false, reason: 'google_reauth_required' });
+const CONTEXT_FAILURE_REASONS = new Set([
+  'google_provider_token_missing',
+  'google_reauth_required',
+  'youtube_api_auth_failed',
+]);
+
+function returnContextFailure(res, error) {
+  if (!CONTEXT_FAILURE_REASONS.has(error?.reason)) return false;
+  res.json({ ok: false, reason: error.reason });
   return true;
 }
 
@@ -145,7 +151,7 @@ router.get('/subscriptions-fingerprint', requireAuth, async (req, res, next) => 
       subscriptionCount: subscriptions.subscriptionCount,
     });
   } catch (e) {
-    if (returnGoogleReauth(res, e)) return;
+    if (returnContextFailure(res, e)) return;
     next(e);
   }
 });
@@ -165,7 +171,7 @@ router.post('/validate-youtube-context', requireAuth, async (req, res, next) => 
 
     return res.json({ ok: true });
   } catch (e) {
-    if (returnGoogleReauth(res, e)) return;
+    if (returnContextFailure(res, e)) return;
     next(e);
   }
 });

@@ -59,14 +59,26 @@ export async function loadGoogleProviderTokens(userId) {
     .select('access_token_ciphertext, refresh_token_ciphertext, access_token_expires_at')
     .eq('user_id', userId)
     .maybeSingle();
-  if (error) throw Object.assign(new Error('google_provider_token_lookup_failed'), { status: 500 });
+  if (error) {
+    throw Object.assign(new Error('google_provider_token_lookup_failed'), {
+      status: 200,
+      reason: 'google_provider_token_missing',
+    });
+  }
   if (!data?.access_token_ciphertext) return null;
 
-  return {
-    accessToken: decrypt(data.access_token_ciphertext),
-    refreshToken: decrypt(data.refresh_token_ciphertext),
-    accessTokenExpiresAt: data.access_token_expires_at || null,
-  };
+  try {
+    return {
+      accessToken: decrypt(data.access_token_ciphertext),
+      refreshToken: decrypt(data.refresh_token_ciphertext),
+      accessTokenExpiresAt: data.access_token_expires_at || null,
+    };
+  } catch {
+    throw Object.assign(new Error('google_provider_token_decrypt_failed'), {
+      status: 200,
+      reason: 'google_provider_token_missing',
+    });
+  }
 }
 
 export async function updateGoogleAccessToken(userId, accessToken, expiresInSeconds) {

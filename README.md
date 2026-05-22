@@ -27,8 +27,8 @@ npm run dev
 | POST | `/api/auth/refresh`  | — | `{refresh_token}` | `{access_token, refresh_token}` (rotated) |
 | POST | `/api/auth/logout`   | — | `{refresh_token}` | 204 |
 | GET  | `/api/me`            | `Bearer <access_token>` | — | `{profile, min_extension_version}` |
-| GET  | `/api/me/subscriptions-fingerprint` | `Bearer <access_token>` | — | `{ok, fingerprint, subscriptionCount}` or `{ok:false, reason:"google_reauth_required"}` |
-| POST | `/api/me/validate-youtube-context` | `Bearer <access_token>` | optional empty body | `{ok: true}` or `{ok: false, reason: "youtube_account_mismatch"}` |
+| GET  | `/api/me/subscriptions-fingerprint` | `Bearer <access_token>` | — | `{ok, fingerprint, subscriptionCount}` or a Google reconnect reason |
+| POST | `/api/me/validate-youtube-context` | `Bearer <access_token>` | optional empty body | `{ok:true}`, true mismatch, or a Google reconnect reason |
 | GET  | `/api/folders?channel_id=...` | `Bearer <access_token>` | — | `{folders: [...]}` |
 | PUT  | `/api/folders`       | `Bearer <access_token>` | `{channel_id, folders[]}` | `{folders, deleted_ids}` or 403 `folder_limit_exceeded` |
 | DELETE | `/api/folders/:id` | `Bearer <access_token>` | — | 204 / 404 |
@@ -87,7 +87,7 @@ Channel slots are enforced when a channel is linked (handled by the website). Th
 
 **`user_id` is always taken from the JWT**, never from the request body — a client cannot write folders for another user regardless of what it sends.
 
-`POST /api/me/validate-youtube-context` is the folder-load guard. The extension sends no Google token and no subscription fingerprint. The server loads the stored Google provider credential, fetches paginated `subscriptions.list` data from the YouTube Data API, builds a deterministic sorted channel fingerprint, and caches the resulting fingerprint per user for at least 60 seconds. It matches that server-side context against rows in `youtube_context_snapshots` that were seeded by a trusted link/verification flow. During rollout it also checks channel IDs already stored in that user's folder metadata as a legacy subscription snapshot. Fewer than three matching known subscriptions is a fail-closed `{ok:false, reason:"youtube_account_mismatch"}` response; the client must not load or sync folders until it receives `{ok:true}`.
+`POST /api/me/validate-youtube-context` is the folder-load guard. The extension sends no Google token and no subscription fingerprint. The server loads the stored Google provider credential, fetches paginated `subscriptions.list` data from the YouTube Data API, builds a deterministic sorted channel fingerprint, and caches the resulting fingerprint per user for at least 60 seconds. It matches that server-side context against rows in `youtube_context_snapshots` that were seeded by a trusted link/verification flow. During rollout it also checks channel IDs already stored in that user's folder metadata as a legacy subscription snapshot. Fewer than three matching known subscriptions after a successful YouTube fetch is a true `{ok:false, reason:"youtube_account_mismatch"}` response. Credential problems stay distinct as `{ok:false, reason:"google_provider_token_missing"}`, `{ok:false, reason:"google_reauth_required"}`, or `{ok:false, reason:"youtube_api_auth_failed"}` so the client can ask for reconnect instead of showing mismatch. The client must not load or sync folders until it receives `{ok:true}`.
 
 `GET /api/folders` without a `channel_id` returns folders only for channels in `allowed_channels` (so historical rows from an unlinked channel are not leaked).
 
