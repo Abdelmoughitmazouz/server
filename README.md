@@ -56,7 +56,7 @@ When the website exchanges a Supabase Google OAuth session, it must include the 
 
 ## Deployment
 
-**Vercel (recommended — same project as foldertube.vercel.app):**
+**Vercel (recommended — same project as folderstube.com):**
 Add `api/[...slug].js` that imports the Express app:
 ```js
 import app from '../server/src/index.js';

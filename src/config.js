@@ -10,8 +10,7 @@ function required(name) {
 }
 
 const DEFAULT_ALLOWED_ORIGINS = [
-  'https://folder-tube.vercel.app',
-  'https://foldertube.vercel.app',
+  'https://folderstube.com',
   'http://localhost:5173',
   'http://localhost:3000',
 ];
