@@ -63,6 +63,7 @@ function tokenExpiry(value) {
 }
 
 router.post('/exchange', async (req, res, next) => {
+  console.log("Request body:", req.body);
   try {
     const extracted = extractSupabaseAccessToken(req);
     if (!extracted.token) {
@@ -93,6 +94,8 @@ router.post('/exchange', async (req, res, next) => {
       return res.status(401).json({ error: 'invalid_supabase_token' });
     }
 
+    console.log("Authenticated user:", data?.user?.id);
+
     const profile = await loadProfile(data.user.id, data.user);
     const body = exchangeBodySchema.safeParse(req.body || {});
     if (body.success && body.data.provider_token) {
@@ -116,10 +119,16 @@ router.post('/exchange', async (req, res, next) => {
     const { token: refresh_token } = signRefreshToken({ user_id: profile.id });
 
     res.json({ access_token, refresh_token, profile });
-  } catch (e) { next(e); }
+  } catch (error) {
+    console.error(error);
+    console.error(error.stack);
+    next(error);
+  }
 });
 
 router.post('/store-google-token', requireAuth, async (req, res, next) => {
+  console.log("Request body:", req.body);
+  console.log("Authenticated user:", req.user?.user_id);
   try {
     const parsed = storeGoogleTokenSchema.safeParse(req.body || {});
     if (!parsed.success) {
@@ -135,7 +144,11 @@ router.post('/store-google-token', requireAuth, async (req, res, next) => {
     await invalidateSubscriptionsFingerprintCache(profile.id);
 
     return res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (error) {
+    console.error(error);
+    console.error(error.stack);
+    next(error);
+  }
 });
 
 const refreshSchema = z.object({ refresh_token: z.string().min(10) });

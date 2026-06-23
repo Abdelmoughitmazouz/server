@@ -1,0 +1,113 @@
+{
+    "icons": {
+        "16": "icon16.plasmo.6c567d50.png",
+        "32": "icon32.plasmo.76b92899.png",
+        "48": "icon48.plasmo.aced7582.png",
+        "64": "icon64.plasmo.8bb5e6e0.png",
+        "128": "icon128.plasmo.3c1ed2d2.png"
+    },
+    "manifest_version": 3,
+    "action": {
+        "default_title": "FolderTube – Organize YouTube subscriptions into folders",
+        "default_icon": {
+            "16": "icon16.plasmo.6c567d50.png",
+            "32": "icon32.plasmo.76b92899.png",
+            "48": "icon48.plasmo.aced7582.png",
+            "64": "icon64.plasmo.8bb5e6e0.png",
+            "128": "icon128.plasmo.3c1ed2d2.png"
+        }
+    },
+    "version": "1.0.9",
+    "author": "FolderTube",
+    "name": "FolderTube – Organize YouTube Subscriptions",
+    "short_name": "FolderTube",
+    "description": "Organize YouTube subscriptions into folders. Group channels, declutter your feed, and manage subscriptions in one click.",
+    "background": {
+        "service_worker": "static/background/index.js"
+    },
+    "permissions": [
+        "storage",
+        "tabs",
+        "alarms"
+    ],
+    "content_scripts": [
+        {
+            "matches": [
+                "https://www.youtube.com/*"
+            ],
+            "js": [
+                "api-client.783917b9.js"
+            ],
+            "css": []
+        },
+        {
+            "matches": [
+                "https://www.youtube.com/*"
+            ],
+            "js": [
+                "drag-manager.a9c5e1f6.js"
+            ],
+            "css": []
+        },
+        {
+            "matches": [
+                "https://www.youtube.com/*"
+            ],
+            "js": [
+                "subscription-cache.8824cd15.js"
+            ],
+            "css": []
+        },
+        {
+            "matches": [
+                "https://www.youtube.com/*"
+            ],
+            "js": [
+                "folder-bar.e58d418b.js"
+            ],
+            "css": []
+        },
+        {
+            "matches": [
+                "*://*.youtube.com/*"
+            ],
+            "js": [
+                "Foldertube-core.d7f980e9.js",
+                "Foldertube-main.4159096a.js",
+                "legacy/subscriptions-filter.js",
+                "legacy/settings-modal.js"
+            ],
+            "css": [
+                "Foldertube.9c171c0f.css"
+            ]
+        }
+    ],
+    "host_permissions": [
+        "https://www.youtube.com/*",
+        "https://foldertube.up.railway.app/*"
+    ],
+    "externally_connectable": {
+        "matches": [
+            "https://foldertube.vercel.app/*"
+        ]
+    },
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "legacy/config-reader.js",
+                "legacy/subscriptions-fetcher.js"
+            ],
+            "matches": [
+                "https://www.youtube.com/*"
+            ]
+        },
+        {
+            "matches": [
+                "https://www.youtube.com/*"
+            ],
+            "resources": [
+                "folder-bar.95bad065.css"
+            ]
+        }
+    ]
+}
