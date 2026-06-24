@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/index.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "migrate": "node scripts/migrate.js",
+    "diagnose": "curl -s http://localhost:3001/api/dev/diagnose | node -e \"process.stdin.resume();let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.stringify(JSON.parse(d),null,2)))\""
   },
   "engines": {
     "node": ">=20"

@@ -22,6 +22,12 @@ function parseOrigins(value) {
     .filter(Boolean);
 }
 
+function warnMissing(name) {
+  if (!process.env[name]) {
+    console.warn(`[config] recommended env var not set: ${name}`);
+  }
+}
+
 export const config = {
   port: Number(process.env.PORT) || 3001,
   supabaseUrl: required('SUPABASE_URL'),
@@ -35,7 +41,7 @@ export const config = {
   refreshTokenTtl: '30d',
   minExtensionVersion: process.env.MIN_EXTENSION_VERSION || '1.0.7',
   devTokenEnabled: process.env.DEV_TOKEN_ENABLED === 'true',
-  googleOauthClientId: process.env.GOOGLE_OAUTH_CLIENT_ID || '',
-  googleOauthClientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET || '',
-  googleTokenEncryptionKey: process.env.GOOGLE_TOKEN_ENCRYPTION_KEY || process.env.JWT_SECRET,
+  googleOauthClientId: (() => { warnMissing('GOOGLE_OAUTH_CLIENT_ID'); return process.env.GOOGLE_OAUTH_CLIENT_ID || ''; })(),
+  googleOauthClientSecret: (() => { warnMissing('GOOGLE_OAUTH_CLIENT_SECRET'); return process.env.GOOGLE_OAUTH_CLIENT_SECRET || ''; })(),
+  googleTokenEncryptionKey: (() => { warnMissing('GOOGLE_TOKEN_ENCRYPTION_KEY'); return process.env.GOOGLE_TOKEN_ENCRYPTION_KEY || process.env.JWT_SECRET; })(),
 };

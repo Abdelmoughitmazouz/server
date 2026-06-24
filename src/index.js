@@ -37,9 +37,19 @@ if (config.devTokenEnabled) {
 }
 
 app.use((err, req, res, _next) => {
-  if (err?.status) return res.status(err.status).json({ error: err.message });
-  console.error('[server] unhandled', err);
-  res.status(500).json({ error: 'internal_error' });
+  console.error('[server] unhandled error', {
+    method: req.method,
+    path: req.path,
+    error: err.message || String(err),
+    stack: err.stack?.split('\n').slice(0, 6).join('\n'),
+    ...(err.supabaseError ? { supabase_error: err.supabaseError } : {}),
+  });
+  const status = err?.status || 500;
+  res.status(status).json({
+    error: err.message || 'internal_error',
+    ...(err.supabaseError ? { supabase_error: err.supabaseError } : {}),
+    ...(process.env.NODE_ENV !== 'production' && err.stack ? { stack: err.stack.split('\n').slice(0, 3) } : {}),
+  });
 });
 
 app.listen(config.port, () => {

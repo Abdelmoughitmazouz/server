@@ -46,10 +46,39 @@ async function loadProfile(user_id, fallbackUser) {
     .select('id, email, plan, allowed_channels, primary_channel_id, channels_limit')
     .eq('id', user_id)
     .maybeSingle();
-  if (error) throw Object.assign(new Error('profile_lookup_failed'), { status: 500 });
-  return data || {
+  if (error && error.code !== '42P01') {
+    console.error('[auth] loadProfile query failed', {
+      userId: user_id,
+      errorCode: error.code,
+      errorMessage: error.message,
+      errorDetails: error.details,
+    });
+    throw Object.assign(new Error(`profile_lookup_failed: ${error.message}`), {
+      status: 500,
+      supabaseError: { code: error.code, message: error.message, details: error.details },
+    });
+  }
+  if (error && error.code === '42P01') {
+    console.error('[auth] loadProfile: users table does not exist. Run migrations.');
+  }
+  if (data) return data;
+
+  // No row in public.users — attempt to create one (handles missing trigger or backfill).
+  const email = fallbackUser?.email || null;
+  const { error: insertError } = await supabase
+    .from('users')
+    .upsert({ id: user_id, email }, { onConflict: 'id' });
+  if (insertError) {
+    console.error('[auth] loadProfile user upsert failed', {
+      userId: user_id,
+      errorCode: insertError.code,
+      errorMessage: insertError.message,
+    });
+  }
+
+  return {
     id: user_id,
-    email: fallbackUser?.email || null,
+    email,
     plan: 'free',
     allowed_channels: [],
     primary_channel_id: null,
@@ -63,7 +92,6 @@ function tokenExpiry(value) {
 }
 
 router.post('/exchange', async (req, res, next) => {
-  console.log("Request body:", req.body);
   try {
     const extracted = extractSupabaseAccessToken(req);
     if (!extracted.token) {
@@ -78,36 +106,29 @@ router.post('/exchange', async (req, res, next) => {
       });
     }
 
-    console.log('[auth] exchange request accepted', {
-      source: extracted.source,
-      bodyKeys: Object.keys(req.body || {}),
-      hasAuthorizationHeader: !!req.headers.authorization,
-    });
-
     const { data, error } = await supabase.auth.getUser(extracted.token);
     if (error || !data?.user) {
       console.error('[auth] exchange rejected: invalid supabase token', {
         source: extracted.source,
-        bodyKeys: Object.keys(req.body || {}),
         supabaseError: error?.message || error || null,
       });
-      return res.status(401).json({ error: 'invalid_supabase_token' });
+      return res.status(401).json({ error: 'invalid_supabase_token', detail: error?.message || null });
     }
-
-    console.log("Authenticated user:", data?.user?.id);
 
     const profile = await loadProfile(data.user.id, data.user);
     const body = exchangeBodySchema.safeParse(req.body || {});
     if (body.success && body.data.provider_token) {
-      const savedProviderToken = await saveGoogleProviderTokens(profile.id, {
-        provider_token: body.data.provider_token,
-        provider_refresh_token: body.data.provider_refresh_token || null,
-        provider_token_expires_at: tokenExpiry(body.data.provider_token_expires_at),
-        email: profile.email || data.user.email || null,
-        primary_channel_id: profile.primary_channel_id || null,
-      });
-      if (savedProviderToken) {
+      try {
+        await saveGoogleProviderTokens(profile.id, {
+          provider_token: body.data.provider_token,
+          provider_refresh_token: body.data.provider_refresh_token || null,
+          provider_token_expires_at: tokenExpiry(body.data.provider_token_expires_at),
+          email: profile.email || data.user.email || null,
+          primary_channel_id: profile.primary_channel_id || null,
+        });
         await invalidateSubscriptionsFingerprintCache(profile.id);
+      } catch (providerErr) {
+        console.error('[auth] provider token save failed (non-fatal)', providerErr.message);
       }
     }
 
@@ -120,15 +141,16 @@ router.post('/exchange', async (req, res, next) => {
 
     res.json({ access_token, refresh_token, profile });
   } catch (error) {
-    console.error(error);
-    console.error(error.stack);
-    next(error);
+    console.error('[auth] /exchange unexpected error', error);
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error.message || 'internal_error',
+      ...(error.supabaseError ? { supabase_error: error.supabaseError } : {}),
+    });
   }
 });
 
 router.post('/store-google-token', requireAuth, async (req, res, next) => {
-  console.log("Request body:", req.body);
-  console.log("Authenticated user:", req.user?.user_id);
   try {
     const parsed = storeGoogleTokenSchema.safeParse(req.body || {});
     if (!parsed.success) {
@@ -145,9 +167,12 @@ router.post('/store-google-token', requireAuth, async (req, res, next) => {
 
     return res.json({ ok: true });
   } catch (error) {
-    console.error(error);
-    console.error(error.stack);
-    next(error);
+    console.error('[auth] /store-google-token error', error);
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error.message || 'internal_error',
+      ...(error.supabaseError ? { supabase_error: error.supabaseError } : {}),
+    });
   }
 });
 
@@ -156,20 +181,23 @@ const refreshSchema = z.object({ refresh_token: z.string().min(10) });
 router.post('/refresh', async (req, res, next) => {
   try {
     const parsed = refreshSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: 'bad_request' });
+    if (!parsed.success) return res.status(400).json({ error: 'bad_request', detail: parsed.error.issues });
 
     let payload;
     try {
       payload = verifyRefreshToken(parsed.data.refresh_token);
-    } catch {
-      return res.status(401).json({ error: 'invalid_refresh_token' });
+    } catch (err) {
+      return res.status(401).json({ error: 'invalid_refresh_token', detail: err.message });
     }
 
-    const { data: revoked } = await supabase
+    const { data: revoked, error: revokedError } = await supabase
       .from('revoked_refresh_tokens')
       .select('jti')
       .eq('jti', payload.jti)
       .maybeSingle();
+    if (revokedError) {
+      console.error('[auth] /refresh revoked check failed', revokedError);
+    }
     if (revoked) return res.status(401).json({ error: 'revoked' });
 
     const profile = await loadProfile(payload.sub);
@@ -180,15 +208,21 @@ router.post('/refresh', async (req, res, next) => {
     });
     const { token: new_refresh_token } = signRefreshToken({ user_id: profile.id });
 
-    // Rotation: revoke the consumed jti so a stolen refresh token can't be replayed.
-    await supabase.from('revoked_refresh_tokens').insert({
+    const { error: insertError } = await supabase.from('revoked_refresh_tokens').insert({
       jti: payload.jti,
       user_id: payload.sub,
       expires_at: new Date(payload.exp * 1000).toISOString(),
     });
+    if (insertError) {
+      console.error('[auth] /refresh revoke insert failed', insertError);
+    }
 
     res.json({ access_token, refresh_token: new_refresh_token });
-  } catch (e) { next(e); }
+  } catch (error) {
+    console.error('[auth] /refresh error', error);
+    const status = error.status || 500;
+    res.status(status).json({ error: error.message || 'internal_error' });
+  }
 });
 
 router.post('/logout', async (req, res, next) => {
@@ -203,7 +237,7 @@ router.post('/logout', async (req, res, next) => {
       return res.status(204).end();
     }
 
-    await supabase.from('revoked_refresh_tokens').upsert(
+    const { error } = await supabase.from('revoked_refresh_tokens').upsert(
       {
         jti: payload.jti,
         user_id: payload.sub,
@@ -211,9 +245,15 @@ router.post('/logout', async (req, res, next) => {
       },
       { onConflict: 'jti' }
     );
+    if (error) {
+      console.error('[auth] /logout upsert failed', error);
+    }
 
     res.status(204).end();
-  } catch (e) { next(e); }
+  } catch (error) {
+    console.error('[auth] /logout error', error);
+    res.status(204).end();
+  }
 });
 
 export default router;

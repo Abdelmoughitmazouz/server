@@ -83,6 +83,18 @@ router.get('/diagnose', async (req, res) => {
     checks: {},
   };
 
+  // 0. Check google_oauth_credentials — needed for Google token storage.
+  try {
+    const { count, error } = await supabase
+      .from('google_oauth_credentials')
+      .select('*', { count: 'exact', head: true });
+    report.checks.google_oauth_credentials = error
+      ? { ok: false, error: explainError(error) }
+      : { ok: true, count };
+  } catch (e) {
+    report.checks.google_oauth_credentials = { ok: false, error: String(e) };
+  }
+
   // 1. Count rows in public.users — confirms table exists and key works.
   try {
     const { count, error } = await supabase
