@@ -151,29 +151,10 @@ router.post('/exchange', async (req, res, next) => {
 });
 
 router.post('/store-google-token', requireAuth, async (req, res, next) => {
-  try {
-    const parsed = storeGoogleTokenSchema.safeParse(req.body || {});
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'bad_request', detail: parsed.error.issues });
-    }
-
-    const profile = await loadProfile(req.user.user_id, req.user);
-    await saveGoogleProviderTokens(profile.id, {
-      provider_token: parsed.data.provider_token,
-      email: profile.email || req.user.email || null,
-      primary_channel_id: profile.primary_channel_id || null,
-    });
-    await invalidateSubscriptionsFingerprintCache(profile.id);
-
-    return res.json({ ok: true });
-  } catch (error) {
-    console.error('[auth] /store-google-token error', error);
-    const status = error.status || 500;
-    res.status(status).json({
-      error: error.message || 'internal_error',
-      ...(error.supabaseError ? { supabase_error: error.supabaseError } : {}),
-    });
-  }
+  console.log("ENTERED_STORE_GOOGLE_TOKEN");
+  return res.json({
+    reached:true
+  });
 });
 
 const refreshSchema = z.object({ refresh_token: z.string().min(10) });

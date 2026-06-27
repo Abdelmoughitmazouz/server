@@ -7,6 +7,12 @@ import foldersRoutes from './routes/folders.js';
 import devRoutes from './routes/dev.js';
 
 const app = express();
+
+app.use((req,res,next)=>{
+    console.log("[GLOBAL]",req.method,req.originalUrl);
+    next();
+});
+
 const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
