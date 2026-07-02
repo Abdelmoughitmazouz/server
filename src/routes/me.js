@@ -7,11 +7,11 @@ import {
   fingerprintForChannelIds,
   getSubscriptionsFingerprint,
 } from '../youtube-subscriptions.js';
+import { countWorkspaces } from '../services/workspace.js';
 
 const router = express.Router();
 
-const BASE_COLS   = 'id, email, plan, allowed_channels, primary_channel_id, channels_limit';
-const EXTRA_COLS  = 'name, subscription_expires_at, subscribed_at';
+const BASE_COLS   = 'id, email, plan, created_at, subscription_expires_at, subscribed_at';
 const MIN_SUBSCRIPTION_OVERLAP = 3;
 const channelIdSchema = z.string().regex(/^UC[\w-]{20,}$/);
 
@@ -51,8 +51,6 @@ async function loadVerifiedSubscriptionContext(userId) {
         .eq('user_id', userId),
     ]);
 
-  // Migration 002 may roll out after this server deploy. Folder metadata keeps
-  // existing users fail-closed but usable until verified snapshots are seeded.
   let snapshotRows = snapshots || [];
   if (snapshotsError?.code === '42703' || snapshotsError?.code === 'PGRST204') {
     const { data: legacySnapshots, error: legacyError } = await supabase
@@ -97,34 +95,29 @@ function hasSubscriptionOverlap(currentSubscriptions, verifiedSubscriptions) {
 
 router.get('/', requireAuth, async (req, res, next) => {
   try {
-    // Try extended select first; gracefully fall back if columns don't exist yet.
     let { data, error } = await supabase
       .from('users')
-      .select(`${BASE_COLS}, ${EXTRA_COLS}`)
+      .select(BASE_COLS)
       .eq('id', req.user.user_id)
       .maybeSingle();
 
     if (error) {
-      ({ data, error } = await supabase
-        .from('users')
-        .select(BASE_COLS)
-        .eq('id', req.user.user_id)
-        .maybeSingle());
+      return next(Object.assign(new Error('profile_lookup_failed'), { status: 500 }));
     }
-
-    if (error) return next(Object.assign(new Error('profile_lookup_failed'), { status: 500 }));
 
     const profile = data || {
       id: req.user.user_id,
       email: req.user.email,
       plan: 'free',
-      allowed_channels: [],
-      primary_channel_id: null,
-      channels_limit: 1,
     };
 
+    const workspaceCount = await countWorkspaces(req.user.user_id);
+
     res.json({
-      profile,
+      profile: {
+        ...profile,
+        workspace_count: workspaceCount,
+      },
       min_extension_version: config.minExtensionVersion,
     });
   } catch (e) { next(e); }

@@ -4,6 +4,7 @@ import { config } from './config.js';
 import authRoutes from './routes/auth.js';
 import meRoutes from './routes/me.js';
 import foldersRoutes from './routes/folders.js';
+import workspacesRoutes from './routes/workspaces.js';
 import devRoutes from './routes/dev.js';
 
 const app = express();
@@ -23,8 +24,9 @@ const corsOptions = {
   },
   credentials: true,
   maxAge: 600,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Workspace-Channel'],
+  exposedHeaders: ['X-Workspace-Channel'],
   optionsSuccessStatus: 204,
 };
 
@@ -36,6 +38,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);
 app.use('/api/me', meRoutes);
 app.use('/api/folders', foldersRoutes);
+app.use('/api/workspaces', workspacesRoutes);
 
 if (config.devTokenEnabled) {
   app.use('/api/dev', devRoutes);

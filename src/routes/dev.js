@@ -6,9 +6,6 @@ import { signAccessToken, signRefreshToken } from '../jwt.js';
 
 const router = express.Router();
 
-// Format a Supabase error so the full PostgREST/PG diagnostic comes back to
-// the caller. Safe ONLY because this whole router is mounted behind
-// DEV_TOKEN_ENABLED — never expose this from production routes.
 function explainError(err) {
   if (!err) return null;
   return {
@@ -31,16 +28,14 @@ router.post('/token', async (req, res, next) => {
 
     const { data: user, error } = await supabase
       .from('users')
-      .select('id, email, plan, allowed_channels, primary_channel_id, channels_limit')
+      .select('id, email, plan')
       .eq('email', email)
       .maybeSingle();
 
     if (error) {
-      console.error('[dev/token] supabase error:', error);
       return res.status(500).json({
         error: 'lookup_failed',
         supabase_error: explainError(error),
-        hint: 'Run GET /api/dev/diagnose for full schema/connectivity report.',
       });
     }
     if (!user) {
@@ -58,10 +53,6 @@ router.post('/token', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// GET /api/dev/diagnose — runs a battery of Supabase checks and reports
-// exactly which one failed. Use this to localise auth/key/schema problems
-// without grepping through server logs. Each check is independent — one
-// failure does not skip the rest.
 router.get('/diagnose', async (req, res) => {
   const key = config.supabaseServiceRoleKey || '';
   const report = {
@@ -70,9 +61,6 @@ router.get('/diagnose', async (req, res) => {
       service_role_key_length: key.length,
       service_role_key_prefix: key.slice(0, 12),
       service_role_key_suffix: key.slice(-6),
-      // The service_role JWT decodes to {role: "service_role"}. The anon key
-      // decodes to {role: "anon"}. We surface the role from the JWT payload
-      // so you can spot the classic mistake of pasting the anon key.
       service_role_key_role: (() => {
         try {
           const payload = JSON.parse(Buffer.from(key.split('.')[1], 'base64').toString('utf8'));
@@ -83,7 +71,6 @@ router.get('/diagnose', async (req, res) => {
     checks: {},
   };
 
-  // 0. Check google_oauth_credentials — needed for Google token storage.
   try {
     const { count, error } = await supabase
       .from('google_oauth_credentials')
@@ -95,7 +82,6 @@ router.get('/diagnose', async (req, res) => {
     report.checks.google_oauth_credentials = { ok: false, error: String(e) };
   }
 
-  // 1. Count rows in public.users — confirms table exists and key works.
   try {
     const { count, error } = await supabase
       .from('users')
@@ -107,11 +93,10 @@ router.get('/diagnose', async (req, res) => {
     report.checks.users_count = { ok: false, error: String(e) };
   }
 
-  // 2. Sample rows — confirms the columns we expect exist.
   try {
     const { data, error } = await supabase
       .from('users')
-      .select('id, email, plan, allowed_channels, primary_channel_id')
+      .select('id, email, plan')
       .limit(5);
     report.checks.users_sample = error
       ? { ok: false, error: explainError(error) }
@@ -120,7 +105,6 @@ router.get('/diagnose', async (req, res) => {
     report.checks.users_sample = { ok: false, error: String(e) };
   }
 
-  // 3. Folders table reachable.
   try {
     const { count, error } = await supabase
       .from('folders')
@@ -132,7 +116,17 @@ router.get('/diagnose', async (req, res) => {
     report.checks.folders_count = { ok: false, error: String(e) };
   }
 
-  // 4. revoked_refresh_tokens — confirms migration 001 was applied.
+  try {
+    const { count, error } = await supabase
+      .from('workspaces')
+      .select('*', { count: 'exact', head: true });
+    report.checks.workspaces_count = error
+      ? { ok: false, error: explainError(error) }
+      : { ok: true, count };
+  } catch (e) {
+    report.checks.workspaces_count = { ok: false, error: String(e) };
+  }
+
   try {
     const { count, error } = await supabase
       .from('revoked_refresh_tokens')

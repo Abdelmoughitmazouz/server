@@ -16,9 +16,6 @@ const exchangeBodySchema = z.object({
   provider_refresh_token: z.string().min(10).optional(),
   provider_token_expires_at: z.union([z.string().datetime(), z.number()]).optional(),
 }).passthrough();
-const storeGoogleTokenSchema = z.object({
-  provider_token: z.string().min(10),
-}).passthrough();
 
 function extractSupabaseAccessToken(req) {
   const h = req.headers.authorization || '';
@@ -43,7 +40,7 @@ function extractSupabaseAccessToken(req) {
 async function loadProfile(user_id, fallbackUser) {
   const { data, error } = await supabase
     .from('users')
-    .select('id, email, plan, allowed_channels, primary_channel_id, channels_limit')
+    .select('id, email, plan, created_at, subscription_expires_at, subscribed_at')
     .eq('id', user_id)
     .maybeSingle();
   if (error && error.code !== '42P01') {
@@ -51,19 +48,15 @@ async function loadProfile(user_id, fallbackUser) {
       userId: user_id,
       errorCode: error.code,
       errorMessage: error.message,
-      errorDetails: error.details,
     });
     throw Object.assign(new Error(`profile_lookup_failed: ${error.message}`), {
       status: 500,
-      supabaseError: { code: error.code, message: error.message, details: error.details },
+      supabaseError: { code: error.code, message: error.message },
     });
   }
-  if (error && error.code === '42P01') {
-    console.error('[auth] loadProfile: users table does not exist. Run migrations.');
-  }
+
   if (data) return data;
 
-  // No row in public.users — attempt to create one (handles missing trigger or backfill).
   const email = fallbackUser?.email || null;
   const { error: insertError } = await supabase
     .from('users')
@@ -80,9 +73,9 @@ async function loadProfile(user_id, fallbackUser) {
     id: user_id,
     email,
     plan: 'free',
-    allowed_channels: [],
-    primary_channel_id: null,
-    channels_limit: 1,
+    created_at: new Date().toISOString(),
+    subscription_expires_at: null,
+    subscribed_at: null,
   };
 }
 
@@ -95,11 +88,6 @@ router.post('/exchange', async (req, res, next) => {
   try {
     const extracted = extractSupabaseAccessToken(req);
     if (!extracted.token) {
-      console.error('[auth] exchange rejected: missing supabase token', {
-        source: extracted.source,
-        bodyKeys: Object.keys(req.body || {}),
-        issues: extracted.issues || null,
-      });
       return res.status(400).json({
         error: 'missing_supabase_token',
         detail: extracted.issues || null,
@@ -108,10 +96,6 @@ router.post('/exchange', async (req, res, next) => {
 
     const { data, error } = await supabase.auth.getUser(extracted.token);
     if (error || !data?.user) {
-      console.error('[auth] exchange rejected: invalid supabase token', {
-        source: extracted.source,
-        supabaseError: error?.message || error || null,
-      });
       return res.status(401).json({ error: 'invalid_supabase_token', detail: error?.message || null });
     }
 
@@ -124,7 +108,6 @@ router.post('/exchange', async (req, res, next) => {
           provider_refresh_token: body.data.provider_refresh_token || null,
           provider_token_expires_at: tokenExpiry(body.data.provider_token_expires_at),
           email: profile.email || data.user.email || null,
-          primary_channel_id: profile.primary_channel_id || null,
         });
         await invalidateSubscriptionsFingerprintCache(profile.id);
       } catch (providerErr) {
@@ -152,9 +135,7 @@ router.post('/exchange', async (req, res, next) => {
 
 router.post('/store-google-token', requireAuth, async (req, res, next) => {
   console.log("ENTERED_STORE_GOOGLE_TOKEN");
-  return res.json({
-    reached:true
-  });
+  return res.json({ reached: true });
 });
 
 const refreshSchema = z.object({ refresh_token: z.string().min(10) });
