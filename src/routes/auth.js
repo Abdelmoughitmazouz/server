@@ -37,24 +37,16 @@ function extractSupabaseAccessToken(req) {
   return { token, source: token ? 'body' : 'missing_body_token', issues: null };
 }
 
-// دالة جلب بيانات المستخدم كاملة مع حقول القناة والبراند
 async function loadProfile(user_id, fallbackUser) {
   const { data, error } = await supabase
     .from('users')
-    .select('id, email, google_email, brand_email, channel_title, primary_channel_id, allowed_channels, channels_limit, plan, created_at, subscription_expires_at, subscribed_at')
+    .select('id, email, brand_email, channel_title, primary_channel_id, allowed_channels, channels_limit, plan, created_at, subscription_expires_at, subscribed_at')
     .eq('id', user_id)
     .maybeSingle();
 
   if (error && error.code !== '42P01') {
-    console.error('[auth] loadProfile query failed', {
-      userId: user_id,
-      errorCode: error.code,
-      errorMessage: error.message,
-    });
-    throw Object.assign(new Error(`profile_lookup_failed: ${error.message}`), {
-      status: 500,
-      supabaseError: { code: error.code, message: error.message },
-    });
+    console.error('[auth] loadProfile query failed', error);
+    throw Object.assign(new Error(`profile_lookup_failed: ${error.message}`), { status: 500 });
   }
 
   if (data) return data;
@@ -65,24 +57,13 @@ async function loadProfile(user_id, fallbackUser) {
   const newUserPayload = {
     id: user_id,
     email,
-    google_email: isBrand ? null : email,
     brand_email: isBrand ? email : null,
     plan: 'free',
     channels_limit: 1,
     allowed_channels: [],
   };
 
-  const { error: insertError } = await supabase
-    .from('users')
-    .upsert(newUserPayload, { onConflict: 'id' });
-
-  if (insertError) {
-    console.error('[auth] loadProfile user upsert failed', {
-      userId: user_id,
-      errorCode: insertError.code,
-      errorMessage: insertError.message,
-    });
-  }
+  await supabase.from('users').upsert(newUserPayload, { onConflict: 'id' });
 
   return {
     ...newUserPayload,
@@ -94,61 +75,63 @@ async function loadProfile(user_id, fallbackUser) {
   };
 }
 
-// دالة استخراج معرف القناة من Google YouTube Data API وربطها تلقائياً
+// دالة جلب الإيميل الحقيقي وقناة اليوتيوب وتحديث الجدول
 async function fetchAndLinkYouTubeChannel(userId, providerToken, currentProfile) {
   if (!providerToken) return null;
   try {
-    const res = await fetch('https://www.googleapis.com/youtube/v3/channels?part=id,snippet&mine=true', {
+    // 1. طلب بيانات القناة من YouTube API
+    const ytPromise = fetch('https://www.googleapis.com/youtube/v3/channels?part=id,snippet&mine=true', {
       headers: { Authorization: `Bearer ${providerToken}` },
-    });
+    }).then(r => r.ok ? r.json() : null).catch(() => null);
 
-    if (!res.ok) {
-      console.warn('[auth] YouTube API channels request failed:', res.status, await res.text().catch(() => ''));
-      return null;
+    // 2. طلب الإيميل الحقيقي من Google UserInfo API
+    const userinfoPromise = fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${providerToken}` },
+    }).then(r => r.ok ? r.json() : null).catch(() => null);
+
+    const [ytData, googleUser] = await Promise.all([ytPromise, userinfoPromise]);
+
+    const channel = ytData?.items?.[0];
+    const channelId = channel?.id || currentProfile?.primary_channel_id;
+    const channelTitle = channel?.snippet?.title || currentProfile?.channel_title;
+
+    // استخراج الإيميل الحقيقي إن وجد
+    let realEmail = googleUser?.email || currentProfile?.email;
+    let brandEmail = currentProfile?.brand_email || null;
+
+    if (currentProfile?.email?.includes('@pages.plusgoogle.com')) {
+      brandEmail = currentProfile.email;
+      if (googleUser?.email && !googleUser.email.includes('@pages.plusgoogle.com')) {
+        realEmail = googleUser.email;
+      }
     }
-
-    const data = await res.json();
-    const channel = data.items?.[0];
-    if (!channel?.id) {
-      console.warn('[auth] No YouTube channel found for provider_token');
-      return null;
-    }
-
-    const channelId = channel.id;
-    const channelTitle = channel.snippet?.title || '';
-    const email = currentProfile?.email || '';
-    const isBrand = email.includes('@pages.plusgoogle.com');
 
     const existingAllowed = Array.isArray(currentProfile?.allowed_channels) ? [...currentProfile.allowed_channels] : [];
-    if (!existingAllowed.includes(channelId)) {
+    if (channelId && !existingAllowed.includes(channelId)) {
       existingAllowed.push(channelId);
     }
 
     const updatePayload = {
+      email: realEmail,
+      brand_email: brandEmail,
       channel_title: channelTitle,
       primary_channel_id: currentProfile?.primary_channel_id || channelId,
       allowed_channels: existingAllowed,
     };
 
-    if (isBrand) {
-      updatePayload.brand_email = email;
-    } else if (email) {
-      updatePayload.google_email = email;
-    }
-
     const { data: updated, error: updateErr } = await supabase
       .from('users')
       .update(updatePayload)
       .eq('id', userId)
-      .select('id, email, google_email, brand_email, channel_title, primary_channel_id, allowed_channels, channels_limit, plan, created_at, subscription_expires_at, subscribed_at')
+      .select('id, email, brand_email, channel_title, primary_channel_id, allowed_channels, channels_limit, plan, created_at, subscription_expires_at, subscribed_at')
       .maybeSingle();
 
     if (updateErr) {
-      console.error('[auth] Failed to update user with YouTube channel info:', updateErr);
+      console.error('[auth] Failed to update user profile:', updateErr);
       return null;
     }
 
-    console.log(`[auth] Auto-linked YouTube channel "${channelTitle}" (${channelId}) to user ${userId}`);
+    console.log(`[auth] Successfully linked: User=${userId}, Email=${realEmail}, Channel=${channelTitle} (${channelId})`);
     return updated;
   } catch (err) {
     console.error('[auth] fetchAndLinkYouTubeChannel error:', err);
@@ -161,7 +144,6 @@ function tokenExpiry(value) {
   return value || null;
 }
 
-// مسار تبديل التوكن والمصادقة
 router.post('/exchange', async (req, res, next) => {
   try {
     const extracted = extractSupabaseAccessToken(req);
@@ -190,7 +172,6 @@ router.post('/exchange', async (req, res, next) => {
         });
         await invalidateSubscriptionsFingerprintCache(profile.id);
 
-        // ربط القناة تلقائياً
         const linkedProfile = await fetchAndLinkYouTubeChannel(profile.id, body.data.provider_token, profile);
         if (linkedProfile) {
           profile = linkedProfile;
@@ -224,7 +205,6 @@ const storeGoogleTokenSchema = z.object({
   provider_token_expires_at: z.union([z.string().datetime(), z.number()]).optional(),
 }).passthrough();
 
-// مسار حفظ توكن جوجل وربط القناة للمستخدم المسجل
 router.post('/store-google-token', requireAuth, async (req, res, next) => {
   try {
     const parsed = storeGoogleTokenSchema.safeParse(req.body);
@@ -244,7 +224,6 @@ router.post('/store-google-token', requireAuth, async (req, res, next) => {
 
     await invalidateSubscriptionsFingerprintCache(userId);
 
-    // ربط القناة تلقائياً
     const linkedProfile = await fetchAndLinkYouTubeChannel(userId, parsed.data.provider_token, profile);
 
     res.json({ ok: true, profile: linkedProfile || profile });
