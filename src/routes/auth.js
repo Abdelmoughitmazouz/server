@@ -1,10 +1,9 @@
 import express from 'express';
 import { z } from 'zod';
 import { supabase } from '../supabase.js';
-import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../jwt.js';
+import { signAccessToken, signRefreshToken, verifyRefreshToken, verifyAccessToken } from '../jwt.js';
 import { saveGoogleProviderTokens } from '../google-provider-tokens.js';
 import { invalidateSubscriptionsFingerprintCache } from '../youtube-subscriptions.js';
-import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -17,26 +16,32 @@ const exchangeBodySchema = z.object({
   provider_token_expires_at: z.union([z.string().datetime(), z.number()]).optional(),
 }).passthrough();
 
-function extractSupabaseAccessToken(req) {
+// دالة مصادقة ذكية تقبل توكن السيرفر أو توكن Supabase
+async function authenticateRequest(req) {
   const h = req.headers.authorization || '';
-  const m = h.match(/^Bearer (.+)$/);
-  if (m?.[1]) {
-    return { token: m[1], source: 'authorization_header' };
-  }
+  const token = h.replace(/^Bearer\s+/i, '').trim();
+  if (!token) return null;
 
-  const parsed = exchangeBodySchema.safeParse(req.body || {});
-  if (!parsed.success) {
-    return { token: null, source: 'invalid_body', issues: parsed.error.issues };
-  }
+  // 1. تجربة فك توكن السيرفر أولاً (HS256)
+  try {
+    const payload = verifyAccessToken(token);
+    if (payload?.user_id) {
+      return { id: payload.user_id, source: 'server_jwt' };
+    }
+  } catch (_) {}
 
-  const token = parsed.data.access_token
-    || parsed.data.supabase_access_token
-    || parsed.data.token
-    || null;
+  // 2. تجربة فك توكن Supabase (ES256 / GoTrue)
+  try {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (data?.user?.id) {
+      return { id: data.user.id, source: 'supabase_jwt', user: data.user };
+    }
+  } catch (_) {}
 
-  return { token, source: token ? 'body' : 'missing_body_token', issues: null };
+  return null;
 }
 
+// دالة تحميل بيانات المستخدم
 async function loadProfile(user_id, fallbackUser) {
   const { data, error } = await supabase
     .from('users')
@@ -75,49 +80,48 @@ async function loadProfile(user_id, fallbackUser) {
   };
 }
 
-// دالة جلب الإيميل الحقيقي وقناة اليوتيوب وتحديث الجدول
+// دالة جلب بيانات القناة وتحديث قاعدة البيانات
 async function fetchAndLinkYouTubeChannel(userId, providerToken, currentProfile) {
   if (!providerToken) return null;
   try {
-    // 1. طلب بيانات القناة من YouTube API
-    const ytPromise = fetch('https://www.googleapis.com/youtube/v3/channels?part=id,snippet&mine=true', {
-      headers: { Authorization: `Bearer ${providerToken}` },
-    }).then(r => r.ok ? r.json() : null).catch(() => null);
+    console.log(`[auth] Fetching YouTube channel info for user ${userId}...`);
+    const res = await fetch('https://www.googleapis.com/youtube/v3/channels?part=id,snippet&mine=true', {
+      headers: { Authorization: `Bearer ${providerToken}` }
+    });
 
-    // 2. طلب الإيميل الحقيقي من Google UserInfo API
-    const userinfoPromise = fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-      headers: { Authorization: `Bearer ${providerToken}` },
-    }).then(r => r.ok ? r.json() : null).catch(() => null);
-
-    const [ytData, googleUser] = await Promise.all([ytPromise, userinfoPromise]);
-
-    const channel = ytData?.items?.[0];
-    const channelId = channel?.id || currentProfile?.primary_channel_id;
-    const channelTitle = channel?.snippet?.title || currentProfile?.channel_title;
-
-    // استخراج الإيميل الحقيقي إن وجد
-    let realEmail = googleUser?.email || currentProfile?.email;
-    let brandEmail = currentProfile?.brand_email || null;
-
-    if (currentProfile?.email?.includes('@pages.plusgoogle.com')) {
-      brandEmail = currentProfile.email;
-      if (googleUser?.email && !googleUser.email.includes('@pages.plusgoogle.com')) {
-        realEmail = googleUser.email;
-      }
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      console.warn('[auth] YouTube API request failed:', res.status, errText);
+      return null;
     }
 
-    const existingAllowed = Array.isArray(currentProfile?.allowed_channels) ? [...currentProfile.allowed_channels] : [];
-    if (channelId && !existingAllowed.includes(channelId)) {
-      existingAllowed.push(channelId);
+    const data = await res.json();
+    const channel = data.items?.[0];
+
+    if (!channel?.id) {
+      console.warn('[auth] No YouTube channel found for this provider token');
+      return null;
+    }
+
+    const channelId = channel.id;
+    const channelTitle = channel.snippet?.title || '';
+    const email = currentProfile?.email || '';
+    const isBrand = email.includes('@pages.plusgoogle.com');
+
+    const allowed = Array.isArray(currentProfile?.allowed_channels) ? [...currentProfile.allowed_channels] : [];
+    if (!allowed.includes(channelId)) {
+      allowed.push(channelId);
     }
 
     const updatePayload = {
-      email: realEmail,
-      brand_email: brandEmail,
       channel_title: channelTitle,
       primary_channel_id: currentProfile?.primary_channel_id || channelId,
-      allowed_channels: existingAllowed,
+      allowed_channels: allowed,
     };
+
+    if (isBrand) {
+      updatePayload.brand_email = email;
+    }
 
     const { data: updated, error: updateErr } = await supabase
       .from('users')
@@ -127,11 +131,11 @@ async function fetchAndLinkYouTubeChannel(userId, providerToken, currentProfile)
       .maybeSingle();
 
     if (updateErr) {
-      console.error('[auth] Failed to update user profile:', updateErr);
+      console.error('[auth] Failed to update user with YouTube channel info:', updateErr);
       return null;
     }
 
-    console.log(`[auth] Successfully linked: User=${userId}, Email=${realEmail}, Channel=${channelTitle} (${channelId})`);
+    console.log(`[auth] Successfully updated user ${userId} -> Channel: ${channelTitle} (${channelId})`);
     return updated;
   } catch (err) {
     console.error('[auth] fetchAndLinkYouTubeChannel error:', err);
@@ -144,23 +148,23 @@ function tokenExpiry(value) {
   return value || null;
 }
 
-router.post('/exchange', async (req, res, next) => {
+// مسار Exchange
+router.post('/exchange', async (req, res) => {
   try {
-    const extracted = extractSupabaseAccessToken(req);
-    if (!extracted.token) {
-      return res.status(400).json({
-        error: 'missing_supabase_token',
-        detail: extracted.issues || null,
-      });
+    const auth = await authenticateRequest(req);
+    const body = exchangeBodySchema.safeParse(req.body || {});
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '') || body.data?.access_token || body.data?.supabase_access_token;
+
+    if (!token) {
+      return res.status(400).json({ error: 'missing_supabase_token' });
     }
 
-    const { data, error } = await supabase.auth.getUser(extracted.token);
+    const { data, error } = await supabase.auth.getUser(token);
     if (error || !data?.user) {
       return res.status(401).json({ error: 'invalid_supabase_token', detail: error?.message || null });
     }
 
     let profile = await loadProfile(data.user.id, data.user);
-    const body = exchangeBodySchema.safeParse(req.body || {});
 
     if (body.success && body.data.provider_token) {
       try {
@@ -191,11 +195,7 @@ router.post('/exchange', async (req, res, next) => {
     res.json({ access_token, refresh_token, profile });
   } catch (error) {
     console.error('[auth] /exchange unexpected error', error);
-    const status = error.status || 500;
-    res.status(status).json({
-      error: error.message || 'internal_error',
-      ...(error.supabaseError ? { supabase_error: error.supabaseError } : {}),
-    });
+    res.status(error.status || 500).json({ error: error.message || 'internal_error' });
   }
 });
 
@@ -205,15 +205,21 @@ const storeGoogleTokenSchema = z.object({
   provider_token_expires_at: z.union([z.string().datetime(), z.number()]).optional(),
 }).passthrough();
 
-router.post('/store-google-token', requireAuth, async (req, res, next) => {
+// مسار store-google-token المصحح
+router.post('/store-google-token', async (req, res) => {
   try {
+    const auth = await authenticateRequest(req);
+    if (!auth) {
+      return res.status(401).json({ error: 'invalid_token' });
+    }
+
     const parsed = storeGoogleTokenSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ error: 'bad_request', detail: parsed.error.issues });
     }
 
-    const userId = req.user.id;
-    let profile = await loadProfile(userId);
+    const userId = auth.id;
+    let profile = await loadProfile(userId, auth.user);
 
     await saveGoogleProviderTokens(userId, {
       provider_token: parsed.data.provider_token,
@@ -235,10 +241,10 @@ router.post('/store-google-token', requireAuth, async (req, res, next) => {
 
 const refreshSchema = z.object({ refresh_token: z.string().min(10) });
 
-router.post('/refresh', async (req, res, next) => {
+router.post('/refresh', async (req, res) => {
   try {
     const parsed = refreshSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: 'bad_request', detail: parsed.error.issues });
+    if (!parsed.success) return res.status(400).json({ error: 'bad_request' });
 
     let payload;
     try {
@@ -247,14 +253,12 @@ router.post('/refresh', async (req, res, next) => {
       return res.status(401).json({ error: 'invalid_refresh_token', detail: err.message });
     }
 
-    const { data: revoked, error: revokedError } = await supabase
+    const { data: revoked } = await supabase
       .from('revoked_refresh_tokens')
       .select('jti')
       .eq('jti', payload.jti)
       .maybeSingle();
-    if (revokedError) {
-      console.error('[auth] /refresh revoked check failed', revokedError);
-    }
+
     if (revoked) return res.status(401).json({ error: 'revoked' });
 
     const profile = await loadProfile(payload.sub);
@@ -265,24 +269,19 @@ router.post('/refresh', async (req, res, next) => {
     });
     const { token: new_refresh_token } = signRefreshToken({ user_id: profile.id });
 
-    const { error: insertError } = await supabase.from('revoked_refresh_tokens').insert({
+    await supabase.from('revoked_refresh_tokens').insert({
       jti: payload.jti,
       user_id: payload.sub,
       expires_at: new Date(payload.exp * 1000).toISOString(),
     });
-    if (insertError) {
-      console.error('[auth] /refresh revoke insert failed', insertError);
-    }
 
     res.json({ access_token, refresh_token: new_refresh_token });
   } catch (error) {
-    console.error('[auth] /refresh error', error);
-    const status = error.status || 500;
-    res.status(status).json({ error: error.message || 'internal_error' });
+    res.status(500).json({ error: error.message || 'internal_error' });
   }
 });
 
-router.post('/logout', async (req, res, next) => {
+router.post('/logout', async (req, res) => {
   try {
     const parsed = refreshSchema.safeParse(req.body);
     if (!parsed.success) return res.status(204).end();
@@ -294,7 +293,7 @@ router.post('/logout', async (req, res, next) => {
       return res.status(204).end();
     }
 
-    const { error } = await supabase.from('revoked_refresh_tokens').upsert(
+    await supabase.from('revoked_refresh_tokens').upsert(
       {
         jti: payload.jti,
         user_id: payload.sub,
@@ -302,13 +301,9 @@ router.post('/logout', async (req, res, next) => {
       },
       { onConflict: 'jti' }
     );
-    if (error) {
-      console.error('[auth] /logout upsert failed', error);
-    }
 
     res.status(204).end();
-  } catch (error) {
-    console.error('[auth] /logout error', error);
+  } catch {
     res.status(204).end();
   }
 });
