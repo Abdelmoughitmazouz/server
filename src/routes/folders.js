@@ -36,6 +36,7 @@ async function resolveWorkspace(userId, channelId) {
   return getOrCreateWorkspace(userId, channelId);
 }
 
+// مسار جلب المجلدات GET /api/folders
 router.get('/', async (req, res, next) => {
   try {
     const channelId = req.headers['x-workspace-channel'] || req.query.channel_id;
@@ -46,11 +47,12 @@ router.get('/', async (req, res, next) => {
       return res.status(400).json({ error: 'bad_channel_id' });
     }
 
-    const workspace = await resolveWorkspace(req.user.user_id, channelId);
+    const userId = req.user.user_id || req.user.id;
+    const workspace = await resolveWorkspace(userId, channelId);
 
     const { data, error } = await supabase
       .from('folders')
-      .select('id, name, color, workspace_id, metadata, created_at')
+      .select('id, name, color, workspace_id, channel_id, workspace_channel_id, metadata, created_at')
       .eq('workspace_id', workspace.id);
 
     if (error) {
@@ -59,9 +61,12 @@ router.get('/', async (req, res, next) => {
     }
 
     return res.json({ folders: Array.isArray(data) ? data : [], workspace_id: workspace.id });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
+// مسار حفظ ومزامنة المجلدات PUT /api/folders
 router.put('/', async (req, res, next) => {
   try {
     const parsed = putBodySchema.safeParse(req.body);
@@ -69,55 +74,69 @@ router.put('/', async (req, res, next) => {
       return res.status(400).json({ error: 'bad_request', detail: parsed.error.issues });
     }
     const { channel_id, folders } = parsed.data;
+    const userId = req.user.user_id || req.user.id;
 
-    const workspace = await resolveWorkspace(req.user.user_id, channel_id);
+    const workspace = await resolveWorkspace(userId, channel_id);
 
-    const { folders_per_workspace: limit } = limitFor((await supabase
+    // التحقق من باقة المستخدم وحد المجلدات
+    const { data: userProfile } = await supabase
       .from('users')
       .select('plan')
-      .eq('id', req.user.user_id)
-      .maybeSingle()).data?.plan || 'free');
+      .eq('id', userId)
+      .maybeSingle();
+
+    const plan = userProfile?.plan || 'free';
+    const { folders_per_workspace: limit } = limitFor(plan);
+
     if (folders.length > limit) {
       return res.status(403).json({
         error: 'folder_limit_exceeded',
-        plan: (await supabase.from('users').select('plan').eq('id', req.user.user_id).maybeSingle()).data?.plan || 'free',
+        plan,
         limit,
         attempted: folders.length,
       });
     }
 
+    // تجهيز الصفوف مع تضمين channel_id و workspace_channel_id بدقة
     const rows = folders.map((f) => ({
       id: f.id,
       name: f.name,
       color: f.color,
-      workspace_id: workspace.id,
-      user_id: req.user.user_id,
+      workspace_id: String(workspace.id),
+      channel_id: channel_id,
+      workspace_channel_id: channel_id,
+      user_id: userId,
       metadata: f.metadata || {},
       ...(f.created_at ? { created_at: f.created_at } : {}),
     }));
 
-    const { data: applied, error: upsertErr } = await supabase
-      .from('folders')
-      .upsert(rows, { onConflict: 'id' })
-      .select('id, name, color, workspace_id, metadata, created_at');
+    if (rows.length > 0) {
+      const { data: applied, error: upsertErr } = await supabase
+        .from('folders')
+        .upsert(rows, { onConflict: 'id' })
+        .select('id, name, color, workspace_id, channel_id, metadata, created_at');
 
-    if (upsertErr) {
-      if (upsertErr.message?.includes('folder_limit_exceeded')) {
-        return res.status(403).json({ error: 'folder_limit_exceeded' });
+      if (upsertErr) {
+        if (upsertErr.message?.includes('folder_limit_exceeded')) {
+          return res.status(403).json({ error: 'folder_limit_exceeded' });
+        }
+        console.error('[folders] upsert failed', upsertErr);
+        return res.status(500).json({ error: 'folders_upsert_failed' });
       }
-      console.error('[folders] upsert failed', upsertErr);
-      return res.status(500).json({ error: 'folders_upsert_failed' });
     }
 
+    // تنظيف المجلدات المحذوفة التي لم تعد موجودة في القائمة
     let deleted_ids = [];
     const localIds = rows.map((r) => r.id);
     let delQ = supabase
       .from('folders')
       .delete()
-      .eq('workspace_id', workspace.id);
+      .eq('workspace_id', String(workspace.id));
+
     if (localIds.length > 0) {
       delQ = delQ.not('id', 'in', `(${localIds.join(',')})`);
     }
+
     const { data: delData, error: delErr } = await delQ.select('id');
     if (delErr) {
       console.error('[folders] cleanup failed', delErr);
@@ -125,20 +144,26 @@ router.put('/', async (req, res, next) => {
       deleted_ids = (delData || []).map((r) => r.id);
     }
 
-    res.json({ folders: applied || [], deleted_ids, workspace_id: workspace.id });
-  } catch (e) { next(e); }
+    console.log(`[folders] Successfully synced ${rows.length} folder(s) for workspace ${workspace.id}`);
+    res.json({ folders: rows, deleted_ids, workspace_id: workspace.id });
+  } catch (e) {
+    next(e);
+  }
 });
 
+// مسار حذف مجلد فردي DELETE /api/folders/:id
 router.delete('/:id', async (req, res, next) => {
   try {
     const parsed = folderIdSchema.safeParse(req.params.id);
     if (!parsed.success) return res.status(400).json({ error: 'bad_id' });
 
+    const userId = req.user.user_id || req.user.id;
+
     const { data, error } = await supabase
       .from('folders')
       .delete()
       .eq('id', parsed.data)
-      .eq('user_id', req.user.user_id)
+      .eq('user_id', userId)
       .select('id');
 
     if (error) {
@@ -148,7 +173,9 @@ router.delete('/:id', async (req, res, next) => {
     if (!data || data.length === 0) return res.status(404).json({ error: 'not_found' });
 
     res.status(204).end();
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 export default router;
