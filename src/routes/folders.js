@@ -21,6 +21,8 @@ const folderInputSchema = z.object({
   id: folderIdSchema,
   name: nameSchema,
   color: colorSchema,
+  parent_id: z.string().uuid().nullable().optional(),
+  parentId: z.string().uuid().nullable().optional(),
   metadata: metadataSchema.optional(),
   created_at: z.string().datetime().optional(),
 });
@@ -36,13 +38,11 @@ async function resolveWorkspace(userId, channelId) {
   return getOrCreateWorkspace(userId, channelId);
 }
 
-// مسار جلب المجلدات GET /api/folders
+// GET /api/folders
 router.get('/', async (req, res, next) => {
   try {
     const channelId = req.headers['x-workspace-channel'] || req.query.channel_id;
-    if (!channelId) {
-      return res.status(400).json({ error: 'missing_channel_id' });
-    }
+    if (!channelId) return res.status(400).json({ error: 'missing_channel_id' });
     if (!channelIdSchema.safeParse(channelId).success) {
       return res.status(400).json({ error: 'bad_channel_id' });
     }
@@ -52,7 +52,7 @@ router.get('/', async (req, res, next) => {
 
     const { data, error } = await supabase
       .from('folders')
-      .select('id, name, color, workspace_id, channel_id, workspace_channel_id, metadata, created_at')
+      .select('id, name, color, parent_id, workspace_id, channel_id, workspace_channel_id, metadata, created_at')
       .eq('workspace_id', workspace.id);
 
     if (error) {
@@ -66,7 +66,7 @@ router.get('/', async (req, res, next) => {
   }
 });
 
-// مسار حفظ ومزامنة المجلدات PUT /api/folders
+// PUT /api/folders
 router.put('/', async (req, res, next) => {
   try {
     const parsed = putBodySchema.safeParse(req.body);
@@ -78,7 +78,6 @@ router.put('/', async (req, res, next) => {
 
     const workspace = await resolveWorkspace(userId, channel_id);
 
-    // التحقق من باقة المستخدم وحد المجلدات
     const { data: userProfile } = await supabase
       .from('users')
       .select('plan')
@@ -97,16 +96,19 @@ router.put('/', async (req, res, next) => {
       });
     }
 
-    // تجهيز الصفوف مع تضمين channel_id و workspace_channel_id بدقة
     const rows = folders.map((f) => ({
       id: f.id,
       name: f.name,
       color: f.color,
+      parent_id: f.parent_id || f.parentId || null,
       workspace_id: String(workspace.id),
       channel_id: channel_id,
       workspace_channel_id: channel_id,
       user_id: userId,
-      metadata: f.metadata || {},
+      metadata: {
+        ...(f.metadata || {}),
+        parentId: f.parent_id || f.parentId || null,
+      },
       ...(f.created_at ? { created_at: f.created_at } : {}),
     }));
 
@@ -114,7 +116,7 @@ router.put('/', async (req, res, next) => {
       const { data: applied, error: upsertErr } = await supabase
         .from('folders')
         .upsert(rows, { onConflict: 'id' })
-        .select('id, name, color, workspace_id, channel_id, metadata, created_at');
+        .select('id, name, color, parent_id, workspace_id, channel_id, metadata, created_at');
 
       if (upsertErr) {
         if (upsertErr.message?.includes('folder_limit_exceeded')) {
@@ -125,7 +127,6 @@ router.put('/', async (req, res, next) => {
       }
     }
 
-    // تنظيف المجلدات المحذوفة التي لم تعد موجودة في القائمة
     let deleted_ids = [];
     const localIds = rows.map((r) => r.id);
     let delQ = supabase
@@ -151,7 +152,7 @@ router.put('/', async (req, res, next) => {
   }
 });
 
-// مسار حذف مجلد فردي DELETE /api/folders/:id
+// DELETE /api/folders/:id
 router.delete('/:id', async (req, res, next) => {
   try {
     const parsed = folderIdSchema.safeParse(req.params.id);
