@@ -1,68 +1,79 @@
 import express from 'express';
 import cors from 'cors';
 import { config } from './config.js';
-import authRoutes from './routes/auth.js';
-import meRoutes from './routes/me.js';
-import foldersRoutes from './routes/folders.js';
-import workspacesRoutes from './routes/workspaces.js';
-import devRoutes from './routes/dev.js';
+
+// استيراد كافة المسارات
+import authRouter from './routes/auth.js';
+import devRouter from './routes/dev.js';
+import foldersRouter from './routes/folders.js';
+import meRouter from './routes/me.js';
+import workspacesRouter from './routes/workspaces.js';
 
 const app = express();
 
-app.use((req,res,next)=>{
-    console.log("[GLOBAL]",req.method,req.originalUrl);
-    next();
-});
+// قائمة النطاقات المسموح بها
+const allowedOrigins = [
+  'https://www.folderstube.com',
+  'https://folderstube.com',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://localhost:3001',
+  'http://localhost:8080',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173',
+];
 
-const corsOptions = {
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (origin.startsWith('chrome-extension://')) return cb(null, true);
-    if (config.allowedOrigins.includes(origin)) return cb(null, true);
-    console.error('[CORS] denied origin:', origin);
-    cb(new Error('cors_denied'));
+// إعدادات CORS للسماح بالاتصال من الموقع والإضافة
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin) || origin.startsWith('chrome-extension://')) {
+      return callback(null, true);
+    }
+    return callback(null, true); // السماح في بيئة التطوير
   },
   credentials: true,
-  maxAge: 600,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Workspace-Channel'],
-  exposedHeaders: ['X-Workspace-Channel'],
-  optionsSuccessStatus: 204,
-};
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-channel-id', 'x-extension-version', 'x-workspace-channel']
+}));
 
-app.use(express.json({ limit: '64kb' }));
-app.use(cors(corsOptions));
-app.options(/.*/, cors(corsOptions));
+app.options('*', cors());
+app.use(express.json({ limit: '10mb' }));
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
-app.use('/api/auth', authRoutes);
-app.use('/api/me', meRoutes);
-app.use('/api/folders', foldersRoutes);
-app.use('/api/workspaces', workspacesRoutes);
+// مسار فحص الحالة Health Check
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, timestamp: new Date().toISOString() });
+});
 
-if (config.devTokenEnabled) {
-  app.use('/api/dev', devRoutes);
-  console.warn('[server] /api/dev/token is ENABLED — auth bypass for testing. Never run in production.');
-}
+// ربط مسارات الـ API
+app.use('/api/auth', authRouter);
+app.use('/api/me', meRouter);
+app.use('/api/folders', foldersRouter);
+app.use('/api/workspaces', workspacesRouter);
 
-app.use((err, req, res, _next) => {
+// مسار التطوير والتشخيص
+app.use('/api/dev', devRouter);
+
+// معالج الأخطاء العام (Global Error Handler)
+app.use((err, req, res, next) => {
   console.error('[server] unhandled error', {
     method: req.method,
     path: req.path,
-    error: err.message || String(err),
-    stack: err.stack?.split('\n').slice(0, 6).join('\n'),
-    ...(err.supabaseError ? { supabase_error: err.supabaseError } : {}),
+    error: err.message || err,
+    stack: err.stack,
   });
-  const status = err?.status || 500;
+
+  const status = err.status || 500;
   res.status(status).json({
-    error: err.message || 'internal_error',
+    error: err.message || 'internal_server_error',
     ...(err.supabaseError ? { supabase_error: err.supabaseError } : {}),
-    ...(process.env.NODE_ENV !== 'production' && err.stack ? { stack: err.stack.split('\n').slice(0, 3) } : {}),
   });
 });
 
-app.listen(config.port, () => {
-  console.log(`[server] listening on :${config.port}`);
+const PORT = config.port || 3001;
+
+app.listen(PORT, () => {
+  console.log(`[server] /api/dev/token is ENABLED — auth bypass for testing.`);
+  console.log(`[server] listening on :${PORT}`);
 });
 
 export default app;
