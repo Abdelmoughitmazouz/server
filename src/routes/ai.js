@@ -14,12 +14,37 @@ const categorizeSchema = z.object({
   language: z.string().optional().default('en')
 });
 
-// قائمة النماذج حسب الأحدث للتجربة التلقائية
-const SUPPORTED_MODELS = [
-  'gemini-2.0-flash',
+// دالة لجلب أسماء النماذج المتاحة لمفتاح المستخدم تلقائياً من Google
+async function getAvailableModel(apiKey) {
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+    if (res.ok) {
+      const data = await res.json();
+      const models = data?.models || [];
+      // البحث عن نموذج يدعم generateContent ويفضل flash
+      const preferred = models.find(m => 
+        m.supportedGenerationMethods?.includes('generateContent') && 
+        (m.name.includes('flash') || m.name.includes('2.5') || m.name.includes('2.0') || m.name.includes('1.5'))
+      ) || models.find(m => m.supportedGenerationMethods?.includes('generateContent'));
+
+      if (preferred?.name) {
+        return preferred.name.replace(/^models\//, '');
+      }
+    }
+  } catch (err) {
+    console.warn('[AI] Could not auto-detect model from Google, using fallback list');
+  }
+  return null;
+}
+
+// قائمة بدائل في حال عدم استجابة الاستعلام
+const FALLBACK_MODELS = [
   'gemini-2.5-flash',
+  'gemini-2.0-flash',
   'gemini-1.5-flash-latest',
   'gemini-1.5-flash',
+  'gemini-1.5-flash-8b',
+  'gemini-1.5-pro',
   'gemini-pro'
 ];
 
@@ -68,21 +93,26 @@ Return ONLY a valid JSON object matching this schema:
 
     const fullPrompt = `${systemInstruction}\n\nChannels to categorize:\n${JSON.stringify(channels)}`;
 
+    // 1. محاولة معرفة النموذج المتاح في حساب المستخدم
+    let activeModel = await getAvailableModel(apiKey);
+    let modelsToTry = activeModel ? [activeModel, ...FALLBACK_MODELS] : FALLBACK_MODELS;
+    modelsToTry = [...new Set(modelsToTry)]; // إزالة التكرار
+
     let geminiRes = null;
     let lastError = null;
 
-    // محاولة تجربة النماذج المتاحة بالترتيب
-    for (const model of SUPPORTED_MODELS) {
+    for (const model of modelsToTry) {
       try {
-        console.log(`[AI] Attempting categorization with model: ${model}`);
+        console.log(`[AI] Calling Gemini model: ${model}`);
         const response = await callGemini(model, apiKey, fullPrompt);
         if (response.ok) {
           geminiRes = response;
+          console.log(`[AI] Success with model: ${model}`);
           break;
         }
         const errJson = await response.json().catch(() => ({}));
-        lastError = errJson?.error?.message || `Status ${response.status}`;
-        console.warn(`[AI] Model ${model} returned ${response.status}: ${lastError}`);
+        lastError = errJson?.error?.message || `HTTP ${response.status}`;
+        console.warn(`[AI] Model ${model} failed (${response.status}): ${lastError}`);
       } catch (e) {
         lastError = e.message;
       }
@@ -90,7 +120,7 @@ Return ONLY a valid JSON object matching this schema:
 
     if (!geminiRes || !geminiRes.ok) {
       console.error('[AI Error from Gemini]:', lastError);
-      return res.status(400).json({ error: 'gemini_error', message: lastError || 'All Gemini models failed' });
+      return res.status(400).json({ error: 'gemini_error', message: lastError || 'Failed to connect to Gemini API' });
     }
 
     const geminiData = await geminiRes.json();
