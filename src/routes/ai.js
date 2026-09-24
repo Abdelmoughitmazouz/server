@@ -14,44 +14,21 @@ const categorizeSchema = z.object({
   language: z.string().optional().default('en')
 });
 
-// قائمة النماذج النصية الحديثة والمتوافقة مع Google Gemini API
-const SUPPORTED_MODELS = [
+// قائمة النماذج الفعالة والأسرع في Google Gemini
+const ACTIVE_MODELS = [
+  'gemini-flash-lite-latest',
   'gemini-3.6-flash',
-  'gemini-3.5-flash-lite',
-  'gemini-3.1-pro-preview',
-  'gemini-2.5-flash',
   'gemini-2.0-flash',
   'gemini-1.5-flash-latest',
   'gemini-1.5-flash'
 ];
 
-// دالة لاكتشاف النماذج النصية المفعلة في مفتاح المستخدم مع استبعاد نماذج الصوت/TTS
-async function getAvailableTextModel(apiKey) {
-  try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
-    if (res.ok) {
-      const data = await res.json();
-      const models = data?.models || [];
-
-      // استبعاد نماذج الصوت والتضمين وتحديد النماذج النصية فقط
-      const textModels = models.filter(m => {
-        const name = m.name.toLowerCase();
-        const isSupportedMethod = m.supportedGenerationMethods?.includes('generateContent');
-        const isExcluded = name.includes('tts') || name.includes('audio') || name.includes('embedding') || name.includes('bidi');
-        return isSupportedMethod && !isExcluded;
-      });
-
-      // تفضيل نماذج flash الحديثة
-      const preferred = textModels.find(m => m.name.includes('3.6') || m.name.includes('3.5')) ||
-                        textModels.find(m => m.name.includes('flash')) ||
-                        textModels[0];
-
-      if (preferred?.name) {
-        return preferred.name.replace(/^models\//, '');
-      }
-    }
-  } catch (_) {}
-  return null;
+function sanitizeColor(hex) {
+  if (typeof hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(hex.trim())) {
+    return hex.trim().toLowerCase();
+  }
+  const defaults = ['#3ea6ff', '#ff4d4d', '#2ecc71', '#f7d794', '#a29bfe', '#ff7675', '#00cec9', '#fdcb6e'];
+  return defaults[Math.floor(Math.random() * defaults.length)];
 }
 
 async function callGemini(model, apiKey, prompt) {
@@ -62,7 +39,8 @@ async function callGemini(model, apiKey, prompt) {
     body: JSON.stringify({
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       generationConfig: {
-        responseMimeType: 'application/json'
+        responseMimeType: 'application/json',
+        temperature: 0.2
       }
     })
   });
@@ -98,25 +76,20 @@ Return ONLY a valid JSON object matching this schema:
 
     const fullPrompt = `${systemInstruction}\n\nChannels to categorize:\n${JSON.stringify(channels)}`;
 
-    // 1. استعلام واكتشاف النموذج النصي النشط لمفتاح المستخدم
-    const activeModel = await getAvailableTextModel(apiKey);
-    const modelsToTry = [...new Set(activeModel ? [activeModel, ...SUPPORTED_MODELS] : SUPPORTED_MODELS)];
-
     let geminiRes = null;
     let lastError = null;
 
-    for (const model of modelsToTry) {
+    for (const model of ACTIVE_MODELS) {
       try {
         console.log(`[AI] Calling Gemini model: ${model}`);
         const response = await callGemini(model, apiKey, fullPrompt);
         if (response.ok) {
           geminiRes = response;
-          console.log(`[AI] Successfully categorized using model: ${model}`);
+          console.log(`[AI] Success with ${model}`);
           break;
         }
         const errJson = await response.json().catch(() => ({}));
         lastError = errJson?.error?.message || `HTTP ${response.status}`;
-        console.warn(`[AI] Model ${model} failed (${response.status}): ${lastError}`);
       } catch (e) {
         lastError = e.message;
       }
@@ -134,7 +107,6 @@ Return ONLY a valid JSON object matching this schema:
       return res.status(500).json({ error: 'empty_ai_response', message: 'Gemini returned an empty response' });
     }
 
-    // تنظيف علامات الـ Markdown إن وُجدت
     rawText = rawText.trim();
     if (rawText.startsWith('```json')) {
       rawText = rawText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
@@ -146,7 +118,6 @@ Return ONLY a valid JSON object matching this schema:
     try {
       result = JSON.parse(rawText);
     } catch (e) {
-      console.error('[AI JSON Parse Error]:', rawText);
       return res.status(500).json({ error: 'invalid_ai_json', message: 'Failed to parse AI JSON response' });
     }
 
@@ -154,7 +125,14 @@ Return ONLY a valid JSON object matching this schema:
       return res.status(500).json({ error: 'invalid_ai_structure', message: 'AI returned invalid folder structure' });
     }
 
-    return res.json({ ok: true, folders: result.folders });
+    // تنقية وتصحيح الألوان والأسماء لضمان قبولها في Supabase بدون أخطاء
+    const cleanFolders = result.folders.map((f, idx) => ({
+      name: String(f.name || `Folder ${idx + 1}`).slice(0, 90).trim(),
+      color: sanitizeColor(f.color),
+      channelIds: Array.isArray(f.channelIds) ? f.channelIds.filter(id => typeof id === 'string' && /^UC[\w-]{20,}$/.test(id)) : []
+    })).filter(f => f.name.length > 0 && f.channelIds.length > 0);
+
+    return res.json({ ok: true, folders: cleanFolders });
   } catch (err) {
     next(err);
   }
