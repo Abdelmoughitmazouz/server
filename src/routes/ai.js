@@ -7,9 +7,9 @@ const router = express.Router();
 
 router.use(requireAuth);
 
-// ─────────────────────────────────────────────────────────────
-// Request validation
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// REQUEST VALIDATION
+// ═══════════════════════════════════════════════════════════════
 
 const categorizeSchema = z.object({
     apiKey: z.string().min(5, 'Invalid Gemini API key'),
@@ -24,9 +24,9 @@ const categorizeSchema = z.object({
     language: z.string().optional().default('en')
 });
 
-// ─────────────────────────────────────────────────────────────
-// Default colors
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// FOLDER COLORS
+// ═══════════════════════════════════════════════════════════════
 
 const DEFAULT_COLORS = [
     '#3ea6ff',
@@ -40,7 +40,15 @@ const DEFAULT_COLORS = [
     '#6c5ce7',
     '#e17055',
     '#0984e3',
-    '#00b894'
+    '#00b894',
+    '#e84393',
+    '#636e72',
+    '#74b9ff',
+    '#55efc4',
+    '#ffeaa7',
+    '#fab1a0',
+    '#81ecec',
+    '#dfe6e9'
 ];
 
 function sanitizeColor(hex, usedColors = new Set()) {
@@ -56,7 +64,6 @@ function sanitizeColor(hex, usedColors = new Set()) {
         }
     }
 
-    // Try to find an unused default color
     for (const color of DEFAULT_COLORS) {
         if (!usedColors.has(color)) {
             usedColors.add(color);
@@ -64,7 +71,6 @@ function sanitizeColor(hex, usedColors = new Set()) {
         }
     }
 
-    // If all colors are used, generate a safe fallback
     const fallback =
         DEFAULT_COLORS[
             Math.floor(Math.random() * DEFAULT_COLORS.length)
@@ -73,11 +79,20 @@ function sanitizeColor(hex, usedColors = new Set()) {
     return fallback;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Preferred Gemini models
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// FAST GEMINI MODEL FALLBACK
+// ═══════════════════════════════════════════════════════════════
+//
+// IMPORTANT:
+// We intentionally do NOT call Google's /models endpoint before
+// every categorization request. That adds another network request
+// and makes the organizer slower.
+//
+// If a model returns 404, 503, 429, etc., we immediately move to
+// the next model.
+// ═══════════════════════════════════════════════════════════════
 
-const PREFERRED_PRIORITY = [
+const GEMINI_MODELS = [
     'gemini-3.6-flash',
     'gemini-3.5-flash',
     'gemini-3.5-flash-lite',
@@ -86,262 +101,471 @@ const PREFERRED_PRIORITY = [
     'gemini-flash-lite-latest'
 ];
 
-// ─────────────────────────────────────────────────────────────
-// Models that should be retried
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// REQUEST TIMEOUT
+// ═══════════════════════════════════════════════════════════════
 
-const RETRYABLE_STATUS_CODES = new Set([
-    429, // Too many requests
-    500, // Internal server error
-    502, // Bad gateway
-    503, // Service unavailable
-    504  // Gateway timeout
-]);
-
-// ─────────────────────────────────────────────────────────────
-// Get active text-generation models
-// ─────────────────────────────────────────────────────────────
-
-async function getActiveTextModels(apiKey) {
-    try {
-        const url =
-            `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
-
-        const res = await fetch(url);
-
-        if (res.ok) {
-            const data = await res.json();
-
-            const models = data?.models || [];
-
-            const textModels = models
-                .filter((m) => {
-                    const name = (m.name || '').toLowerCase();
-                    const methods = m.supportedGenerationMethods || [];
-
-                    const isGenerate =
-                        methods.includes('generateContent');
-
-                    const isExcluded =
-                        name.includes('tts') ||
-                        name.includes('audio') ||
-                        name.includes('embed') ||
-                        name.includes('imagen') ||
-                        name.includes('bidi') ||
-                        name.includes('realtime') ||
-                        name.includes('clip') ||
-                        name.includes('transcribe');
-
-                    return isGenerate && !isExcluded;
-                })
-                .map((m) =>
-                    String(m.name || '').replace(/^models\//, '')
-                )
-                .filter(Boolean);
-
-            if (textModels.length > 0) {
-                // Remove duplicates
-                const uniqueModels = [...new Set(textModels)];
-
-                // Sort according to our preferred priority
-                uniqueModels.sort((a, b) => {
-                    let idxA = PREFERRED_PRIORITY.indexOf(a);
-                    let idxB = PREFERRED_PRIORITY.indexOf(b);
-
-                    if (idxA === -1) idxA = 9999;
-                    if (idxB === -1) idxB = 9999;
-
-                    return idxA - idxB;
-                });
-
-                return uniqueModels;
-            }
-        }
-
-        console.warn(
-            '[AI] Google Models API returned no usable text models'
-        );
-    } catch (err) {
-        console.warn(
-            '[AI] ListModels query failed, using fallback list:',
-            err?.message || err
-        );
-    }
-
-    // Safe fallback.
-    // No obsolete gemini-2.5-flash-lite here.
-    return [...PREFERRED_PRIORITY];
-}
-
-// ─────────────────────────────────────────────────────────────
-// Call Gemini
-// ─────────────────────────────────────────────────────────────
-
-async function callGemini(model, apiKey, prompt) {
-    const encodedModel = encodeURIComponent(model);
-
-    const url =
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodedModel}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-    return fetch(url, {
-        method: 'POST',
-
-        headers: {
-            'Content-Type': 'application/json'
-        },
-
-        body: JSON.stringify({
-            contents: [
-                {
-                    role: 'user',
-                    parts: [
-                        {
-                            text: prompt
-                        }
-                    ]
-                }
-            ],
-
-            generationConfig: {
-                responseMimeType: 'application/json',
-                temperature: 0.2
-            }
-        })
-    });
-}
-
-// ─────────────────────────────────────────────────────────────
-// Sleep helper
-// ─────────────────────────────────────────────────────────────
+const GEMINI_TIMEOUT_MS = 20000;
 
 function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ─────────────────────────────────────────────────────────────
-// Call Gemini with retry/backoff
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// GEMINI REQUEST
+// ═══════════════════════════════════════════════════════════════
 
-async function callGeminiWithRetry(
-    model,
-    apiKey,
-    prompt,
-    maxRetries = 2
-) {
-    let lastResponse = null;
+async function callGemini(model, apiKey, prompt) {
+    const controller = new AbortController();
 
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-            console.log(
-                `[AI] ${model} attempt ${attempt + 1}/${maxRetries + 1}`
-            );
+    const timeout = setTimeout(() => {
+        controller.abort();
+    }, GEMINI_TIMEOUT_MS);
 
-            const response = await callGemini(
-                model,
-                apiKey,
-                prompt
-            );
+    try {
+        const url =
+            `https://generativelanguage.googleapis.com/v1beta/models/` +
+            `${encodeURIComponent(model)}:generateContent?key=` +
+            `${encodeURIComponent(apiKey)}`;
 
-            lastResponse = response;
+        return await fetch(url, {
+            method: 'POST',
 
-            // Success
-            if (response.ok) {
-                return response;
-            }
+            headers: {
+                'Content-Type': 'application/json'
+            },
 
-            // Don't retry permanent/client errors
-            if (!RETRYABLE_STATUS_CODES.has(response.status)) {
-                return response;
-            }
+            signal: controller.signal,
 
-            // Last attempt
-            if (attempt === maxRetries) {
-                return response;
-            }
+            body: JSON.stringify({
+                contents: [
+                    {
+                        role: 'user',
+                        parts: [
+                            {
+                                text: prompt
+                            }
+                        ]
+                    }
+                ],
 
-            // Exponential backoff
-            const delay =
-                1000 * Math.pow(2, attempt);
+                generationConfig: {
+                    responseMimeType: 'application/json',
+                    temperature: 0.15
+                }
+            })
+        });
 
-            console.warn(
-                `[AI] ${model} returned HTTP ${response.status}. ` +
-                `Retrying in ${delay}ms...`
-            );
-
-            await sleep(delay);
-
-        } catch (err) {
-            console.warn(
-                `[AI] ${model} network error on attempt ${attempt + 1}:`,
-                err?.message || err
-            );
-
-            if (attempt === maxRetries) {
-                throw err;
-            }
-
-            const delay =
-                1000 * Math.pow(2, attempt);
-
-            await sleep(delay);
-        }
+    } finally {
+        clearTimeout(timeout);
     }
-
-    return lastResponse;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Extract JSON text from Gemini response
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// DEEP CATEGORIZATION PROMPT
+// ═══════════════════════════════════════════════════════════════
 
-function extractGeminiText(geminiData) {
+function buildPrompt(language) {
+    return `
+You are an expert YouTube subscription organizer.
+
+Your task is to deeply analyze a user's YouTube subscriptions and organize
+them into intelligent, specific, useful folders.
+
+The goal is NOT to minimize the number of folders.
+
+The goal is to create a clean and detailed organization that reflects the
+actual subjects of the channels.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LANGUAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All folder names MUST be written in this language:
+
+"${language}"
+
+Channel IDs must remain EXACTLY unchanged.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NUMBER OF FOLDERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Create approximately 10 to 20 folders when the subscription collection
+contains enough diversity to justify them.
+
+Do NOT force the collection into only 5 or 6 broad folders.
+
+However:
+
+- Do NOT create one folder per channel.
+- Do NOT create extremely narrow folders containing only one channel
+  unless the channel is genuinely unique.
+- Group channels together when they clearly share the same subject.
+
+The number of folders should depend on the actual channels.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IMPORTANT SEPARATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+These subjects should normally be separated when there are enough
+channels to justify separate folders:
+
+SCIENCE ≠ EDUCATION
+
+Science channels should go into a Science folder.
+
+General educational/tutorial channels should go into Education.
+
+Do NOT combine them simply because both involve learning.
+
+Examples:
+
+Science
+Education
+Astronomy & Space
+Physics
+Biology
+Mathematics
+
+should be considered separate possibilities.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TECHNOLOGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Separate technical subjects when there are enough channels.
+
+Possible categories:
+
+Technology
+Programming & Software
+AI & Machine Learning
+Cybersecurity
+Gadgets & Hardware
+Tech News
+Web Development
+Game Development
+
+Do NOT put every technology-related channel into one giant
+"Technology" folder if the subscriptions clearly contain distinct
+technical subjects.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KNOWLEDGE & HUMANITIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Possible categories:
+
+History
+Geography
+Philosophy
+Psychology
+Science
+Education
+Documentaries
+Culture
+
+Psychology should normally be separate from Health when there are
+enough psychology channels.
+
+History should normally be separate from general Education when there
+are enough history channels.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HEALTH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Possible categories:
+
+Health
+Fitness
+Nutrition
+Psychology
+Mental Wellness
+Medicine
+
+Do not automatically merge Psychology with Health.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LANGUAGES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Language learning deserves its own category when there are multiple
+language-learning channels.
+
+Possible categories:
+
+Language Learning
+English Learning
+French Learning
+Spanish Learning
+Other Languages
+
+Do not automatically put language-learning channels into Education.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUSINESS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Possible categories:
+
+Business
+Finance & Investing
+Entrepreneurship
+Marketing
+Economics
+
+Keep Business and Finance separate when there are enough channels.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CREATIVE CONTENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Possible categories:
+
+Art & Design
+Photography
+Music
+Film & Movies
+Animation
+Writing
+Creative Production
+
+Music should normally be separate from general Entertainment.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ENTERTAINMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Possible categories:
+
+Entertainment
+Comedy
+Pop Culture
+Movies
+TV
+Podcasts
+Celebrity & Culture
+
+Do not merge Gaming into Entertainment when gaming channels are
+clearly present.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GAMING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Possible categories:
+
+Gaming
+Game Reviews
+Game Development
+Esports
+Gaming News
+
+Gaming should normally be separate from Entertainment.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LIFESTYLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Possible categories:
+
+Lifestyle
+Food & Cooking
+Travel
+Fashion & Beauty
+DIY & Making
+Home & Organization
+Cars & Motors
+
+Do not merge DIY & Making into Technology simply because some DIY
+channels use technology.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SPORTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Possible categories:
+
+Sports
+Football
+Basketball
+Combat Sports
+Motorsport
+Tennis
+Fitness
+
+If one sport has enough channels, it can have its own folder.
+
+Sports should not be merged into Entertainment.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NEWS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Possible categories:
+
+News
+Politics
+Current Affairs
+World News
+Technology News
+
+Do not automatically merge News and Politics unless the channels
+actually cover both subjects.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHANNEL ANALYSIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Analyze each channel based on:
+
+1. Channel name
+2. Clear keywords in the channel name
+3. Apparent primary subject
+4. The relationship between channels
+5. Whether the channel belongs to a specialized topic
+
+Use the PRIMARY subject of the channel.
+
+Do not guess extremely specific subjects without evidence.
+
+If a channel is ambiguous, place it in the most reasonable broader
+category rather than inventing a specialized category.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VERY IMPORTANT RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. EVERY input channel MUST be assigned.
+
+2. Each channel MUST appear in exactly ONE folder.
+
+3. NEVER omit a channel.
+
+4. NEVER duplicate a channel across folders.
+
+5. NEVER invent a channel ID.
+
+6. Use the EXACT channel IDs from the input.
+
+7. Folder names must be concise and meaningful.
+
+8. Folder names MUST use the requested language.
+
+9. Every folder MUST have a valid HEX color.
+
+10. Folder colors should be distinct.
+
+11. Prefer specific categories when the data supports them.
+
+12. Do not create broad combined folders such as:
+    "Science & Education"
+    when Science and Education can reasonably be separated.
+
+13. Do not create broad combined folders such as:
+    "Psychology & Health"
+    when Psychology and Health can reasonably be separated.
+
+14. Do not create:
+    "Tech & DIY"
+    when Technology and DIY are clearly different groups.
+
+15. Do not create:
+    "Entertainment & Gaming"
+    when Gaming has enough channels to stand alone.
+
+16. Do not create:
+    "Music & Entertainment"
+    when Music has enough channels to stand alone.
+
+17. Do not create:
+    "Sports & Entertainment"
+    when Sports has enough channels to stand alone.
+
+18. The organization should be useful for browsing subscriptions.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Return ONLY valid JSON.
+
+No Markdown.
+
+No explanation.
+
+No comments.
+
+No code fences.
+
+Use exactly this structure:
+
+{
+  "folders": [
+    {
+      "name": "Folder Name",
+      "color": "#3ea6ff",
+      "channelIds": [
+        "UCxxxxxxxxxxxxxxxxxxxxxx"
+      ]
+    }
+  ]
+}
+`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EXTRACT GEMINI TEXT
+// ═══════════════════════════════════════════════════════════════
+
+function extractGeminiText(data) {
     const parts =
-        geminiData?.candidates?.[0]?.content?.parts || [];
+        data?.candidates?.[0]?.content?.parts || [];
 
     const textPart = parts.find(
-        (part) => typeof part?.text === 'string'
+        part => typeof part?.text === 'string'
     );
 
     if (!textPart?.text) {
         return null;
     }
 
-    let rawText = textPart.text.trim();
+    let text = textPart.text.trim();
 
-    // Remove Markdown code fences if Gemini returns them
-    rawText = rawText
+    // Safety cleanup in case Gemini ignores the JSON-only instruction.
+    text = text
         .replace(/^```json\s*/i, '')
         .replace(/^```\s*/i, '')
         .replace(/\s*```$/i, '')
         .trim();
 
-    return rawText;
+    return text;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Validate AI folder assignment
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// VALIDATE ASSIGNMENTS
+// ═══════════════════════════════════════════════════════════════
 
-function validateFolderAssignments(
-    inputChannels,
-    folders
-) {
+function validateAssignments(inputChannels, folders) {
     const inputIds = new Set(
-        inputChannels.map((channel) => channel.id)
+        inputChannels.map(channel => channel.id)
     );
 
     const assignedIds = folders.flatMap(
-        (folder) => folder.channelIds
+        folder => folder.channelIds
     );
 
-    const missing = [
-        ...inputIds
-    ].filter(
-        (id) => !assignedIds.includes(id)
+    const assignedSet = new Set(assignedIds);
+
+    const missing = [...inputIds].filter(
+        id => !assignedSet.has(id)
     );
 
     const unknown = assignedIds.filter(
-        (id) => !inputIds.has(id)
+        id => !inputIds.has(id)
     );
 
     const seen = new Set();
@@ -367,9 +591,80 @@ function validateFolderAssignments(
     };
 }
 
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// CLEAN AI FOLDERS
+// ═══════════════════════════════════════════════════════════════
+
+function cleanAIResult(result, inputChannels) {
+    const usedColors = new Set();
+
+    const inputIds = new Set(
+        inputChannels.map(channel => channel.id)
+    );
+
+    if (!result || !Array.isArray(result.folders)) {
+        return [];
+    }
+
+    const folders = [];
+
+    for (let index = 0; index < result.folders.length; index++) {
+        const folder = result.folders[index];
+
+        if (!folder || typeof folder !== 'object') {
+            continue;
+        }
+
+        const name =
+            String(
+                folder.name ||
+                `Folder ${index + 1}`
+            )
+                .trim()
+                .slice(0, 90);
+
+        if (!name) {
+            continue;
+        }
+
+        const rawIds =
+            Array.isArray(folder.channelIds)
+                ? folder.channelIds
+                : [];
+
+        const channelIds = [
+            ...new Set(
+                rawIds.filter(
+                    id =>
+                        typeof id === 'string' &&
+                        inputIds.has(id) &&
+                        /^UC[\w-]{20,}$/.test(id)
+                )
+            )
+        ];
+
+        if (channelIds.length === 0) {
+            continue;
+        }
+
+        const color = sanitizeColor(
+            folder.color,
+            usedColors
+        );
+
+        folders.push({
+            name,
+            color,
+            channelIds
+        });
+    }
+
+    return folders;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // POST /categorize
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
 
 router.post('/categorize', async (req, res, next) => {
     try {
@@ -395,11 +690,11 @@ router.post('/categorize', async (req, res, next) => {
         } = parsed.data;
 
         // ─────────────────────────────────────────────
-        // Remove invalid / duplicate input channels
+        // Clean input channels
         // ─────────────────────────────────────────────
 
         const uniqueChannels = [];
-        const seenChannelIds = new Set();
+        const seenInputIds = new Set();
 
         for (const channel of channels) {
             if (
@@ -409,11 +704,11 @@ router.post('/categorize', async (req, res, next) => {
                 continue;
             }
 
-            if (seenChannelIds.has(channel.id)) {
+            if (seenInputIds.has(channel.id)) {
                 continue;
             }
 
-            seenChannelIds.add(channel.id);
+            seenInputIds.add(channel.id);
 
             uniqueChannels.push({
                 id: channel.id,
@@ -427,107 +722,64 @@ router.post('/categorize', async (req, res, next) => {
         if (uniqueChannels.length === 0) {
             return res.status(400).json({
                 error: 'no_valid_channels',
-                message: 'No valid YouTube channels were provided'
+                message:
+                    'No valid YouTube channels were provided'
             });
         }
 
+        console.log(
+            `[AI] Deep categorization started for ` +
+            `${uniqueChannels.length} channels`
+        );
+
         // ─────────────────────────────────────────────
-        // AI prompt
+        // Build prompt
         // ─────────────────────────────────────────────
 
-        const systemInstruction = `
-You are an expert YouTube subscription organizer.
-
-Analyze the provided list of YouTube channels and categorize them
-into 5 to 12 logical folders.
-
-Examples:
-- Tech & Programming
-- Gaming
-- Music
-- Education
-- Sports
-- News & Politics
-- Entertainment
-- Lifestyle
-- Science
-- Business
-
-Rules:
-
-1. Write folder names in the requested language: "${language}".
-
-2. Create between 5 and 12 folders when the number and variety
-   of channels make that reasonable.
-
-3. Every channel MUST be assigned to exactly ONE folder.
-
-4. NEVER omit a channel.
-
-5. NEVER assign the same channel to multiple folders.
-
-6. NEVER invent channel IDs.
-
-7. Use the exact channel IDs supplied in the input.
-
-8. Give every folder a distinct HEX color.
-
-9. Colors must be valid six-digit HEX values.
-
-10. Return ONLY valid JSON.
-
-Required JSON structure:
-
-{
-  "folders": [
-    {
-      "name": "Folder Name",
-      "color": "#3ea6ff",
-      "channelIds": ["UCxxxx", "UCyyyy"]
-    }
-  ]
-}
-`;
+        const systemInstruction =
+            buildPrompt(language);
 
         const fullPrompt =
-            `${systemInstruction}\n\n` +
-            `Channels to categorize:\n` +
+            systemInstruction +
+            '\n\n' +
+            'CHANNELS TO CATEGORIZE:\n' +
             JSON.stringify(uniqueChannels);
 
         // ─────────────────────────────────────────────
-        // Get available models
+        // FAST MODEL FALLBACK
         // ─────────────────────────────────────────────
-
-        const availableModels =
-            await getActiveTextModels(apiKey);
-
-        console.log(
-            '[AI] Available/prioritized models:',
-            availableModels
-        );
 
         let geminiRes = null;
         let lastError = null;
 
-        // ─────────────────────────────────────────────
-        // Try models
-        // ─────────────────────────────────────────────
-
-        for (const model of availableModels) {
+        for (const model of GEMINI_MODELS) {
             try {
                 console.log(
-                    `[AI] Attempting model: ${model}`
+                    `[AI] Trying model: ${model}`
                 );
 
+                const startTime = Date.now();
+
                 const response =
-                    await callGeminiWithRetry(
+                    await callGemini(
                         model,
                         apiKey,
-                        fullPrompt,
-                        2
+                        fullPrompt
                     );
 
-                if (response?.ok) {
+                const elapsed =
+                    Date.now() - startTime;
+
+                console.log(
+                    `[AI] ${model} responded in ${elapsed}ms ` +
+                    `(HTTP ${response.status})`
+                );
+
+                // ─────────────────────────────────
+                // SUCCESS
+                // ─────────────────────────────────
+
+                if (response.ok) {
                     geminiRes = response;
 
                     console.log(
@@ -537,56 +789,83 @@ Required JSON structure:
                     break;
                 }
 
-                let errJson = {};
+                // ─────────────────────────────────
+                // Read error
+                // ─────────────────────────────────
+
+                let errorData = {};
 
                 try {
-                    errJson =
+                    errorData =
                         await response.json();
                 } catch (_) {
-                    errJson = {};
+                    errorData = {};
                 }
 
                 lastError =
-                    errJson?.error?.message ||
-                    `HTTP ${response?.status || 'unknown'}`;
+                    errorData?.error?.message ||
+                    `HTTP ${response.status}`;
 
                 console.warn(
-                    `[AI] Model ${model} failed ` +
-                    `(${response?.status}): ${lastError}`
+                    `[AI] ${model} failed ` +
+                    `(${response.status}): ${lastError}`
                 );
 
-                // API key problems should stop immediately.
+                // ─────────────────────────────────
+                // AUTH ERRORS
+                // ─────────────────────────────────
+
                 if (
-                    response?.status === 401 ||
-                    response?.status === 403
+                    response.status === 401 ||
+                    response.status === 403
                 ) {
                     return res.status(401).json({
                         error: 'gemini_auth_error',
                         message:
                             lastError ||
-                            'Gemini API key is invalid or unauthorized'
+                            'Invalid or unauthorized Gemini API key'
                     });
                 }
 
-            } catch (err) {
+                // ─────────────────────────────────
+                // FAST FALLBACK
+                // ─────────────────────────────────
+                //
+                // No retry here.
+                //
+                // 503 → next model immediately
+                // 429 → next model immediately
+                // 404 → next model immediately
+                // 400 → next model immediately
+                // etc.
+                //
+                // This is intentionally fast.
+                // ─────────────────────────────────
+
+            } catch (error) {
                 lastError =
-                    err?.message ||
-                    'Unknown Gemini error';
+                    error?.name === 'AbortError'
+                        ? `Model ${model} timed out after ${GEMINI_TIMEOUT_MS}ms`
+                        : (
+                            error?.message ||
+                            'Unknown Gemini error'
+                        );
 
                 console.warn(
-                    `[AI] Model ${model} threw an error:`,
-                    lastError
+                    `[AI] ${model} failed: ${lastError}`
                 );
+
+                // Immediately continue to next model.
             }
         }
 
-        // ─────────────────────────────────────────────
-        // All models failed
-        // ─────────────────────────────────────────────
+        // ═════════════════════════════════════════════
+        // ALL MODELS FAILED
+        // ═════════════════════════════════════════════
 
         if (!geminiRes || !geminiRes.ok) {
             console.error(
-                '[AI Error from Gemini]:',
+                '[AI] All Gemini models failed:',
                 lastError
             );
 
@@ -598,9 +877,9 @@ Required JSON structure:
             });
         }
 
-        // ─────────────────────────────────────────────
-        // Parse Gemini response
-        // ─────────────────────────────────────────────
+        // ═════════════════════════════════════════════
+        // READ GEMINI RESPONSE
+        // ═════════════════════════════════════════════
 
         const geminiData =
             await geminiRes.json();
@@ -609,6 +888,10 @@ Required JSON structure:
             extractGeminiText(geminiData);
 
         if (!rawText) {
+            console.error(
+                '[AI] Gemini returned no text'
+            );
+
             return res.status(500).json({
                 error: 'empty_ai_response',
                 message:
@@ -616,118 +899,51 @@ Required JSON structure:
             });
         }
 
-        // ─────────────────────────────────────────────
-        // Parse JSON
-        // ─────────────────────────────────────────────
+        // ═════════════════════════════════════════════
+        // PARSE JSON
+        // ═════════════════════════════════════════════
 
         let result;
 
         try {
             result = JSON.parse(rawText);
-        } catch (err) {
+        } catch (error) {
             console.error(
-                '[AI JSON Parse Error]:',
+                '[AI] JSON parse failed:',
                 rawText
             );
 
             return res.status(500).json({
                 error: 'invalid_ai_json',
                 message:
-                    'Failed to parse AI JSON response'
+                    'Failed to parse Gemini JSON response'
             });
         }
 
-        // ─────────────────────────────────────────────
-        // Validate basic structure
-        // ─────────────────────────────────────────────
-
-        if (
-            !result ||
-            !Array.isArray(result.folders)
-        ) {
-            return res.status(500).json({
-                error: 'invalid_ai_structure',
-                message:
-                    'AI returned invalid folder structure'
-            });
-        }
-
-        // ─────────────────────────────────────────────
-        // Clean folders
-        // ─────────────────────────────────────────────
-
-        const usedColors = new Set();
+        // ═════════════════════════════════════════════
+        // CLEAN RESULT
+        // ═════════════════════════════════════════════
 
         const cleanFolders =
-            result.folders
-                .map((folder, index) => {
-                    const name =
-                        String(
-                            folder?.name ||
-                            `Folder ${index + 1}`
-                        )
-                            .slice(0, 90)
-                            .trim();
-
-                    const color =
-                        sanitizeColor(
-                            folder?.color,
-                            usedColors
-                        );
-
-                    const channelIds =
-                        Array.isArray(
-                            folder?.channelIds
-                        )
-                            ? [
-                                ...new Set(
-                                    folder.channelIds
-                                        .filter(
-                                            (id) =>
-                                                typeof id === 'string' &&
-                                                /^UC[\w-]{20,}$/.test(id)
-                                        )
-                                )
-                            ]
-                            : [];
-
-                    return {
-                        name,
-                        color,
-                        channelIds
-                    };
-                })
-                .filter(
-                    (folder) =>
-                        folder.name.length > 0 &&
-                        folder.channelIds.length > 0
-                );
-
-        // ─────────────────────────────────────────────
-        // Validate folder count
-        // ─────────────────────────────────────────────
+            cleanAIResult(
+                result,
+                uniqueChannels
+            );
 
         if (cleanFolders.length === 0) {
             return res.status(500).json({
                 error: 'empty_ai_folders',
                 message:
-                    'AI did not return any valid folders'
+                    'Gemini returned no valid folders'
             });
         }
 
-        if (cleanFolders.length > 12) {
-            console.warn(
-                `[AI] AI returned ${cleanFolders.length} folders; ` +
-                `expected maximum is 12`
-            );
-        }
-
-        // ─────────────────────────────────────────────
-        // Validate channel assignments
-        // ─────────────────────────────────────────────
+        // ═════════════════════════════════════════════
+        // VALIDATE ASSIGNMENTS
+        // ═════════════════════════════════════════════
 
         const assignment =
-            validateFolderAssignments(
+            validateAssignments(
                 uniqueChannels,
                 cleanFolders
             );
@@ -736,38 +952,64 @@ Required JSON structure:
             console.error(
                 '[AI] Invalid channel assignment:',
                 {
+                    totalChannels:
+                        uniqueChannels.length,
+
+                    folders:
+                        cleanFolders.length,
+
                     missing:
                         assignment.missing.length,
-                    unknown:
-                        assignment.unknown.length,
+
                     duplicates:
-                        assignment.duplicates.length
+                        assignment.duplicates.length,
+
+                    unknown:
+                        assignment.unknown.length
                 }
             );
 
             return res.status(500).json({
                 error: 'invalid_ai_assignment',
+
                 message:
                     'Gemini did not assign every channel exactly once',
+
                 detail: {
+                    totalChannels:
+                        uniqueChannels.length,
+
+                    folders:
+                        cleanFolders.length,
+
                     missingCount:
                         assignment.missing.length,
+
                     duplicateCount:
                         assignment.duplicates.length,
+
                     unknownCount:
                         assignment.unknown.length
                 }
             });
         }
 
-        // ─────────────────────────────────────────────
-        // Success
-        // ─────────────────────────────────────────────
+        // ═════════════════════════════════════════════
+        // FINAL SUCCESS
+        // ═════════════════════════════════════════════
 
         console.log(
-            `[AI] Successfully categorized ` +
-            `${uniqueChannels.length} channels into ` +
+            `[AI] Deep categorization complete: ` +
+            `${uniqueChannels.length} channels → ` +
             `${cleanFolders.length} folders`
+        );
+
+        console.log(
+            '[AI] Folders:',
+            cleanFolders.map(folder => ({
+                name: folder.name,
+                channels: folder.channelIds.length
+            }))
         );
 
         return res.json({
