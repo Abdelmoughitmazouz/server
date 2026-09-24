@@ -1,10 +1,6 @@
 import express from 'express';
 import cors from 'cors';
 import { config } from './config.js';
-import aiRouter from './routes/ai.js';
-
-// ... مع باقي المسارات:
-app.use('/api/ai', aiRouter);
 
 // استيراد كافة المسارات
 import authRouter from './routes/auth.js';
@@ -12,6 +8,7 @@ import devRouter from './routes/dev.js';
 import foldersRouter from './routes/folders.js';
 import meRouter from './routes/me.js';
 import workspacesRouter from './routes/workspaces.js';
+import aiRouter from './routes/ai.js';
 
 const app = express();
 
@@ -32,7 +29,7 @@ const corsOptions = {
     if (!origin || allowedOrigins.includes(origin) || origin.startsWith('chrome-extension://')) {
       return callback(null, true);
     }
-    return callback(null, true); // السماح للجميع أثناء التطوير
+    return callback(null, true);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
@@ -55,8 +52,7 @@ app.use('/api/auth', authRouter);
 app.use('/api/me', meRouter);
 app.use('/api/folders', foldersRouter);
 app.use('/api/workspaces', workspacesRouter);
-
-// مسار التطوير والتشخيص
+app.use('/api/ai', aiRouter);
 app.use('/api/dev', devRouter);
 
 // معالج الأخطاء العام (Global Error Handler)
