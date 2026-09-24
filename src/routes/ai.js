@@ -1,415 +1,271 @@
-import express from 'express';
-import { z } from 'zod';
-import { requireAuth } from '../middleware/auth.js';
-import { supabase } from '../supabase.js';
-import { limitFor } from '../plans.js';
-
-const router = express.Router();
-router.use(requireAuth);
-
-const categorizeSchema = z.object({
-  apiKey: z.string().min(5, 'Invalid Gemini API key'),
-  channels: z.array(
-    z.object({
-      id: z.string(),
-      name: z.string()
-    })
-  ).min(1, 'No channels provided'),
-  language: z.string().optional().default('en')
-});
-
-const DEFAULT_COLORS = [
-  '#3ea6ff', '#ff4d4d', '#2ecc71', '#f7d794', '#a29bfe',
-  '#ff7675', '#00cec9', '#fdcb6e', '#6c5ce7', '#e17055',
-  '#0984e3', '#00b894', '#e84393', '#636e72', '#74b9ff',
-  '#55efc4', '#ffeaa7', '#fab1a0', '#81ecec', '#dfe6e9',
-  '#b2bec3', '#ff78cb', '#fd79a8', '#e056fd', '#686de0'
-];
-
-function sanitizeColor(hex, usedColors = new Set()) {
-  if (typeof hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(hex.trim())) {
-    const normalized = hex.trim().toLowerCase();
-    if (!usedColors.has(normalized)) {
-      usedColors.add(normalized);
-      return normalized;
-    }
-  }
-  for (const color of DEFAULT_COLORS) {
-    if (!usedColors.has(color)) {
-      usedColors.add(color);
-      return color;
-    }
-  }
-  return DEFAULT_COLORS[Math.floor(Math.random() * DEFAULT_COLORS.length)];
-}
-
-const PREFERRED_PRIORITY = [
-  'gemini-3.6-flash',
-  'gemini-3.5-flash',
-  'gemini-3.5-flash-lite',
-  'gemini-flash-lite-latest',
-  'gemini-2.0-flash',
-  'gemini-3.7-flash',
-  'gemini-3.8-flash'
-];
-
-async function getActiveTextModels(apiKey) {
-  try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
-    if (res.ok) {
-      const data = await res.json();
-      const models = data?.models || [];
-
-      const textModels = models
-        .filter(m => {
-          const name = (m.name || '').toLowerCase();
-          const methods = m.supportedGenerationMethods || [];
-          const isGenerate = methods.includes('generateContent');
-          const isExcluded = name.includes('tts') || name.includes('audio') || 
-                             name.includes('embed') || name.includes('imagen') || 
-                             name.includes('bidi') || name.includes('realtime') ||
-                             name.includes('clip') || name.includes('transcribe');
-          return isGenerate && !isExcluded;
-        })
-        .map(m => m.name.replace(/^models\//, ''));
-
-      if (textModels.length > 0) {
-        textModels.sort((a, b) => {
-          let idxA = PREFERRED_PRIORITY.indexOf(a);
-          let idxB = PREFERRED_PRIORITY.indexOf(b);
-          if (idxA === -1) idxA = 999;
-          if (idxB === -1) idxB = 999;
-          return idxA - idxB;
-        });
-        return textModels;
-      }
-    }
-  } catch (err) {
-    console.warn('[AI] ListModels query failed, using fallback list');
-  }
-  return PREFERRED_PRIORITY;
-}
-
-async function callGemini(model, apiKey, prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-  return fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0.15
-      }
-    })
-  });
-}
-
-// بناء البرومبت العميق مع مراعاة خطة المستخدم
-function buildDeepPrompt(language, maxFolders) {
-  const countInstruction = maxFolders <= 3
-    ? `PLAN LIMITATION:
-This user is on a plan with a strict limit of ${maxFolders} folders.
-You MUST create AT MOST ${maxFolders} broad, high-level folders (e.g. "Tech & Education", "Gaming & Entertainment", "Music & Lifestyle").`
-    : `NUMBER OF FOLDERS:
-Create approximately 10 to 20 folders depending on the actual channel collection.
-The exact number of folders should depend on the diversity of the subscriptions.
-Do NOT force unrelated subjects into the same folder just to reduce the number of folders.
-At the same time, do NOT create a separate folder for every individual channel.
-A folder should contain multiple channels when those channels genuinely share the same subject or purpose.`;
-
-  return `
-You are an expert YouTube subscription organizer.
-
-Your job is to deeply analyze the user's YouTube subscriptions and organize them into meaningful, specific, fine-grained folders.
-
-IMPORTANT:
-Do NOT create broad generic folders when the channels clearly belong to different subjects.
-
-For example:
-- Science MUST be separate from Education.
-- Programming MUST be separate from general Technology when there are enough programming channels.
-- Psychology MUST be separate from Health when there are enough psychology channels.
-- Gaming MUST be separate from Entertainment.
-- Music MUST be separate from Entertainment.
-- History MUST be separate from Education when there are enough history channels.
-- Language Learning MUST be separate from Education.
-- DIY & Making MUST be separate from Technology.
-- Business & Finance MUST be separate from Technology.
-- Sports MUST always be separate from general Entertainment.
-- News & Politics MUST be separate from general Entertainment.
-- Travel MUST be separate from Lifestyle when there are enough travel channels.
-
-${countInstruction}
-
-Use the following taxonomy as guidance, but create additional categories when the channels clearly justify them:
-
-SCIENCE:
-- Science
-- Astronomy & Space
-- Biology
-- Physics
-- Chemistry
-- Mathematics
-
-EDUCATION:
-- Education
-- Study & Academic
-- Language Learning
-- Tutorials & How-To
-
-TECHNOLOGY:
-- Technology
-- Programming & Software Development
-- AI & Machine Learning
-- Gadgets & Hardware
-- Cybersecurity
-
-KNOWLEDGE:
-- History
-- Geography
-- Philosophy
-- Psychology
-- Science Communication
-
-HEALTH:
-- Health
-- Fitness
-- Nutrition
-- Mental Wellness
-
-BUSINESS:
-- Business
-- Finance & Investing
-- Entrepreneurship
-
-CREATIVE:
-- Art & Design
-- Photography
-- Music
-- Film & Movies
-
-ENTERTAINMENT:
-- Entertainment
-- Comedy
-- Pop Culture
-- Podcasts
-
-GAMING:
-- Gaming
-- Game Development
-- Esports
-
-LIFESTYLE:
-- Lifestyle
-- Food & Cooking
-- Travel
-- Fashion & Beauty
-- DIY & Making
-- Cars & Motors
-
-SPORTS:
-- Football
-- Basketball
-- Combat Sports
-- Motorsport
-- Other Sports
-
-NEWS:
-- News
-- Politics
-- Current Affairs
-
-CATEGORY DECISION RULES:
-1. Analyze the actual channel name and its apparent subject.
-2. Prefer specific categories over broad categories.
-3. If there are several channels about science, create "Science" separately.
-4. If there are several channels about educational content, create "Education" separately.
-5. Never merge Science and Education merely because both are related to learning.
-6. Never merge Psychology and Health merely because psychology is related to mental health.
-7. Never merge Programming and Technology if programming/software development has enough channels to justify its own folder.
-8. Never merge Gaming with Entertainment.
-9. Never merge Music with Entertainment.
-10. Never merge Sports with Entertainment.
-11. Never merge News with Politics unless the channels genuinely focus on both.
-12. Do not create overly narrow folders containing only one channel unless the channel is clearly unique and cannot reasonably belong elsewhere.
-13. Aim for useful folders that a user would actually want to browse.
-14. Folder names must be concise and descriptive.
-15. Folder names must be written in the requested language: "${language}".
-16. Every input channel MUST be assigned to exactly ONE folder.
-17. NEVER omit a channel.
-18. NEVER duplicate a channel across folders.
-19. NEVER invent channel IDs.
-20. Use the exact channel IDs provided in the input.
-21. Every folder must have a unique HEX color.
-22. Return ONLY valid JSON.
-
-Required output structure:
-{
-  "folders": [
-    {
-      "name": "Folder Name",
-      "color": "#3ea6ff",
-      "channelIds": [
-        "UCxxxxxxxxxxxxxxxxxxxxxx"
-      ]
-    }
-  ]
-}
-
-Remember:
-The goal is to create a clean, intelligent, detailed organization of the user's subscriptions.
-`;
-}
-
-// دالة التصحيح التلقائي لضمان التوافق مع قاعدة البيانات 100%
-function autoRepairAssignments(inputChannels, rawFolders, maxAllowed, language) {
-  const inputIds = new Set(inputChannels.map(c => c.id));
-  const assigned = new Set();
-  const usedColors = new Set();
-  let cleanFolders = [];
-
-  for (const f of rawFolders || []) {
-    if (!f || !f.name) continue;
-    const validIds = [];
-    for (const cid of (f.channelIds || [])) {
-      if (typeof cid === 'string' && inputIds.has(cid) && !assigned.has(cid)) {
-        assigned.add(cid);
-        validIds.push(cid);
-      }
-    }
-    if (validIds.length > 0) {
-      cleanFolders.push({
-        name: String(f.name).trim().slice(0, 90),
-        color: sanitizeColor(f.color, usedColors),
-        channelIds: validIds
-      });
-    }
-  }
-
-  // ضم أي قنوات نسيها النموذج
-  const missingIds = inputChannels.filter(c => !assigned.has(c.id)).map(c => c.id);
-  if (missingIds.length > 0) {
-    if (cleanFolders.length > 0) {
-      cleanFolders[0].channelIds.push(...missingIds);
-    } else {
-      cleanFolders.push({
-        name: language.startsWith('ar') ? 'اشتراكات عامة' : 'General Subscriptions',
-        color: '#3ea6ff',
-        channelIds: missingIds
-      });
-    }
-  }
-
-  // دمج المجلدات الزائدة فقط إن تجاوزت حد خطة المستخدم (3 للمجاني) لمنع خطأ folder_limit_exceeded
-  if (cleanFolders.length > maxAllowed) {
-    const kept = cleanFolders.slice(0, maxAllowed - 1);
-    const remaining = cleanFolders.slice(maxAllowed - 1);
-    const mergedIds = [...new Set(remaining.flatMap(f => f.channelIds))];
-    const otherLabel = language.startsWith('ar') ? 'منوعات واشتراكات أخرى' : 'General & Other';
-    
-    kept.push({
-      name: otherLabel,
-      color: sanitizeColor('#a29bfe', usedColors),
-      channelIds: mergedIds
-    });
-    cleanFolders = kept;
-  }
-
-  return cleanFolders;
-}
-
-router.post('/categorize', async (req, res, next) => {
-  try {
-    const parsed = categorizeSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'bad_request', message: 'Invalid request data', detail: parsed.error.issues });
-    }
-
-    const { apiKey, channels, language } = parsed.data;
-    const userId = req.user.user_id || req.user.id || req.user.sub;
-
-    let plan = 'free';
-    try {
-      const { data: userProfile } = await supabase
-        .from('users')
-        .select('plan')
-        .eq('id', userId)
-        .maybeSingle();
-      plan = userProfile?.plan || req.user.plan || 'free';
-    } catch (_) {}
-
-    const { folders_per_workspace: folderLimit } = limitFor(plan);
-    const maxAllowed = Number.isFinite(folderLimit) ? folderLimit : 20;
-
-    const uniqueChannels = [];
-    const seenInputIds = new Set();
-    for (const c of channels) {
-      if (typeof c.id === 'string' && /^UC[\w-]{20,}$/.test(c.id) && !seenInputIds.has(c.id)) {
-        seenInputIds.add(c.id);
-        uniqueChannels.push({ id: c.id, name: String(c.name || 'Channel').trim().slice(0, 150) });
-      }
-    }
-
-    if (uniqueChannels.length === 0) {
-      return res.status(400).json({ error: 'no_valid_channels', message: 'No valid channels provided' });
-    }
-
-    console.log(`[AI] Deep categorization started for ${uniqueChannels.length} channels (Plan: ${plan}, Limit: ${maxAllowed})`);
-
-    const systemPrompt = buildDeepPrompt(language, maxAllowed);
-    const fullPrompt = `${systemPrompt}\n\nCHANNELS TO CATEGORIZE:\n${JSON.stringify(uniqueChannels)}`;
-
-    const availableModels = await getActiveTextModels(apiKey);
-    let geminiRes = null;
-    let lastError = null;
-
-    for (const model of availableModels) {
-      try {
-        console.log(`[AI] Calling model: ${model}`);
-        const response = await callGemini(model, apiKey, fullPrompt);
-        if (response.ok) {
-          geminiRes = response;
-          console.log(`[AI] Success with model: ${model}`);
-          break;
+// ── ✨ AI Auto-Categorize Button, Progress Modal & Database Sync ───
+(function _initAICategorizer() {
+    // دالة شاملة وقوية لجلب معرف قناة يوتيوب الحالية من الجلسة أو الذاكرة أو التخزين
+    async function getActiveChannelId() {
+        if (typeof Storage !== 'undefined' && Storage.channelId && /^UC[\w-]{20,}$/.test(Storage.channelId)) {
+            return Storage.channelId;
         }
-        const errJson = await response.json().catch(() => ({}));
-        lastError = errJson?.error?.message || `HTTP ${response.status}`;
-        console.warn(`[AI] Model ${model} failed (${response.status}): ${lastError}`);
-      } catch (e) {
-        lastError = e.message;
-      }
+        if (typeof ChannelManager !== 'undefined' && ChannelManager.currentChannelId && /^UC[\w-]{20,}$/.test(ChannelManager.currentChannelId)) {
+            return ChannelManager.currentChannelId;
+        }
+        if (typeof ChannelManager !== 'undefined' && ChannelManager.getChannelId) {
+            const cid = ChannelManager.getChannelId();
+            if (cid && /^UC[\w-]{20,}$/.test(cid)) return cid;
+        }
+        if (typeof SupabaseAuth !== 'undefined' && SupabaseAuth._session?.profile) {
+            const prof = SupabaseAuth._session.profile;
+            if (prof.primary_channel_id && /^UC[\w-]{20,}$/.test(prof.primary_channel_id)) {
+                return prof.primary_channel_id;
+            }
+            if (Array.isArray(prof.allowed_channels) && prof.allowed_channels.length > 0) {
+                const first = prof.allowed_channels.find(id => /^UC[\w-]{20,}$/.test(id));
+                if (first) return first;
+            }
+        }
+        try {
+            const stored = await chrome.storage.local.get(['ytt_user_profile']);
+            const prof = stored?.ytt_user_profile;
+            if (prof?.primary_channel_id && /^UC[\w-]{20,}$/.test(prof.primary_channel_id)) {
+                return prof.primary_channel_id;
+            }
+            if (Array.isArray(prof?.allowed_channels) && prof.allowed_channels.length > 0) {
+                const first = prof.allowed_channels.find(id => /^UC[\w-]{20,}$/.test(id));
+                if (first) return first;
+            }
+        } catch (_) {}
+        try {
+            if (window.ytcfg && typeof window.ytcfg.get === 'function') {
+                const delegated = window.ytcfg.get('DELEGATED_SESSION_ID');
+                if (delegated && /^UC[\w-]{20,}$/.test(delegated)) return delegated;
+                const chId = window.ytcfg.get('CHANNEL_ID');
+                if (chId && /^UC[\w-]{20,}$/.test(chId)) return chId;
+            }
+        } catch (_) {}
+        return null;
     }
 
-    if (!geminiRes || !geminiRes.ok) {
-      console.error('[AI] All models failed:', lastError);
-      return res.status(400).json({ error: 'gemini_error', message: lastError || 'Gemini API call failed' });
+    function createAIButton() {
+        if (document.getElementById('ytt-btn-ai-sort')) return;
+        const controls = document.querySelector('.ytt-badge-header-controls');
+        if (!controls) return;
+
+        const aiBtn = document.createElement('span');
+        aiBtn.id = 'ytt-btn-ai-sort';
+        aiBtn.className = 'ytt-btn';
+        aiBtn.setAttribute('role', 'button');
+        aiBtn.setAttribute('tabindex', '0');
+        aiBtn.setAttribute('aria-label', 'AI Auto-Categorize');
+        aiBtn.style.cssText = 'color: #ffd700; cursor: pointer; display: inline-flex; align-items: center; justify-content: center;';
+        aiBtn.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" height="20" viewBox="0 -960 960 960" width="20" fill="currentColor">
+                <path d="M480-160q-134 0-227-93t-93-227q0-134 93-227t227-93q134 0 227 93t93 227q0 134-93 227t-227 93Zm0-80q100 0 170-70t70-170q0-100-70-170t-170-70q-100 0-170 70t-70 170q0 100 70 170t170 70Zm-40-160 40-88 88-40-88-40-40-88-40 88-88 40 88 40 40 88Zm0-320Z"/>
+            </svg>
+        `;
+
+        aiBtn.addEventListener('click', () => _startAICategorization());
+        controls.insertBefore(aiBtn, controls.firstChild);
     }
 
-    const geminiData = await geminiRes.json();
-    let rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    function _createProgressModal() {
+        document.getElementById('ytt-ai-progress-modal')?.remove();
 
-    rawText = rawText.trim();
-    if (rawText.startsWith('```json')) {
-      rawText = rawText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-    } else if (rawText.startsWith('```')) {
-      rawText = rawText.replace(/^```\s*/, '').replace(/\s*```$/, '');
+        const backdrop = document.createElement('div');
+        backdrop.id = 'ytt-ai-progress-modal';
+        backdrop.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.65);backdrop-filter:blur(6px);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:Roboto,Segoe UI,sans-serif;animation:ytt-fade-in 0.2s ease;';
+
+        const card = document.createElement('div');
+        card.style.cssText = 'background:#212121;border:1px solid rgba(255,255,255,0.15);border-radius:16px;width:90%;max-width:420px;padding:28px 24px;color:#fff;box-shadow:0 16px 40px rgba(0,0,0,0.6);text-align:center;display:flex;flex-direction:column;align-items:center;gap:16px;';
+        card.innerHTML = `
+            <div style="width:48px;height:48px;border-radius:50%;background:rgba(255,215,0,0.15);display:flex;align-items:center;justify-content:center;color:#ffd700;">
+                <svg viewBox="0 -960 960 960" width="28" height="28" fill="currentColor"><path d="M480-160q-134 0-227-93t-93-227q0-134 93-227t227-93q134 0 227 93t93 227q0 134-93 227t-227 93Zm-40-160 40-88 88-40-88-40-40-88-40 88-88 40 88 40 40 88Z"/></svg>
+            </div>
+            <h3 style="margin:0;font-size:18px;font-weight:600;">FolderTube AI Organizer</h3>
+            <p id="ytt-ai-status-text" style="margin:0;font-size:13px;color:#aaa;line-height:1.4;">Analyzing your subscriptions...</p>
+            <div style="width:100%;height:6px;background:rgba(255,255,255,0.1);border-radius:3px;overflow:hidden;">
+                <div id="ytt-ai-progress-bar" style="width:15%;height:100%;background:linear-gradient(90deg,#ffd700,#ff9f43);border-radius:3px;transition:width 0.3s ease;"></div>
+            </div>
+            <span id="ytt-ai-percent-text" style="font-size:12px;color:#888;font-weight:600;">15%</span>
+        `;
+
+        backdrop.appendChild(card);
+        document.body.appendChild(backdrop);
+
+        return {
+            update: (text, percent) => {
+                const txt = document.getElementById('ytt-ai-status-text');
+                const bar = document.getElementById('ytt-ai-progress-bar');
+                const pct = document.getElementById('ytt-ai-percent-text');
+                if (txt) txt.textContent = text;
+                if (bar) bar.style.width = percent + '%';
+                if (pct) pct.textContent = percent + '%';
+            },
+            close: () => backdrop.remove()
+        };
     }
 
-    let result;
-    try {
-      result = JSON.parse(rawText);
-    } catch (_) {
-      return res.status(500).json({ error: 'invalid_ai_json', message: 'Failed to parse AI JSON' });
+    async function _startAICategorization() {
+        const tm = window.tabManager;
+        const sm = window.subscriptionManager;
+        if (!tm) return;
+
+        const storage = await chrome.storage.local.get('ytt_gemini_api_key');
+        const apiKey = storage?.ytt_gemini_api_key?.trim();
+
+        if (!apiKey) {
+            alert('Please enter your Google Gemini API Key first in FolderTube Settings ⚙️ -> General.');
+            return;
+        }
+
+        const allChannels = (sm && sm.getAll && sm.getAll()) || [];
+        if (allChannels.length === 0) {
+            alert('No subscriptions found to organize.');
+            return;
+        }
+
+        const confirmMsg = `✨ FolderTube AI will deeply analyze and organize ${allChannels.length} channels into accurate folders.\n\nAll existing folders will be replaced with the new AI categories.\n\nDo you want to proceed?`;
+        if (!confirm(confirmMsg)) return;
+
+        const modal = _createProgressModal();
+
+        try {
+            modal.update(`Deeply analyzing ${allChannels.length} channels with Gemini AI...`, 30);
+
+            // إرسال الاسم والمعرف @handle للحصول على أعلى دقة تصنيف ممكنة
+            const channelPayload = allChannels.map(c => ({
+                id: c.id,
+                name: c.name || c.title || 'Channel',
+                handle: c.handle || (c.url && c.url.includes('/@') ? c.url.split('/@')[1] : undefined)
+            }));
+
+            const lang = window.ytt_language || 'en';
+
+            const resp = await new Promise((resolve) => {
+                chrome.runtime.sendMessage({
+                    type: 'apiCall',
+                    method: 'POST',
+                    path: '/api/ai/categorize',
+                    body: {
+                        apiKey: apiKey,
+                        channels: channelPayload,
+                        language: lang
+                    }
+                }, resolve);
+            });
+
+            if (!resp || !resp.ok || !resp.data?.folders) {
+                const errObj = resp?.error || {};
+                const errMsg = errObj.body?.message || 
+                               errObj.body?.error || 
+                               errObj.message || 
+                               errObj.code || 
+                               'AI categorization failed';
+                throw new Error(errMsg);
+            }
+
+            modal.update('Generating smart folders & assigning channels...', 65);
+
+            const aiFolders = resp.data.folders;
+            const newTabData = {};
+            const newBadgeData = {};
+            const foldersSyncPayload = [];
+
+            aiFolders.forEach((f, idx) => {
+                const folderId = crypto.randomUUID();
+                const folderColor = f.color || '#3ea6ff';
+                const folderName = f.name || 'Folder';
+                const channelIds = Array.isArray(f.channelIds) ? f.channelIds : [];
+
+                newTabData[folderId] = {
+                    name: folderName,
+                    color: folderColor,
+                    index: idx,
+                    hidden: false,
+                    channelIds: channelIds,
+                    createdAt: new Date().toISOString(),
+                    metadata: {
+                        channels: channelIds.map(cid => ({ id: cid, tabID: folderId })),
+                        index: idx,
+                        sortMode: 'manual'
+                    }
+                };
+
+                channelIds.forEach(cid => {
+                    newBadgeData[cid] = {
+                        tabID: folderId,
+                        order: Date.now(),
+                        favorite: false
+                    };
+                });
+
+                foldersSyncPayload.push({
+                    id: folderId,
+                    name: folderName,
+                    color: folderColor,
+                    parent_id: null,
+                    parentId: null,
+                    created_at: new Date().toISOString(),
+                    metadata: {
+                        channels: channelIds.map(cid => ({ id: cid, tabID: folderId })),
+                        index: idx,
+                        sortMode: 'manual',
+                        hidden: false
+                    }
+                });
+            });
+
+            modal.update('Saving folders directly to database...', 85);
+
+            tm.tabData = newTabData;
+            tm.badgeData = newBadgeData;
+
+            const cid = await getActiveChannelId();
+            console.log('[FolderTube AI] Target YouTube Channel ID for Database:', cid);
+
+            if (cid && typeof Storage !== 'undefined' && Storage.getScopedKey) {
+                try {
+                    localStorage.setItem(Storage.getScopedKey('ytt-tabs'), JSON.stringify(newTabData));
+                    localStorage.setItem(Storage.getScopedKey('ytt-badges'), JSON.stringify(newBadgeData));
+                    localStorage.setItem('ytt-tabs', JSON.stringify(newTabData));
+                    localStorage.setItem('ytt-badges', JSON.stringify(newBadgeData));
+                } catch (_) {}
+            }
+
+            // المزامنة والحفظ الأكيد مع قاعدة بيانات Supabase
+            if (cid && window.FolderTubeApi?.folders?.sync) {
+                try {
+                    await window.FolderTubeApi.folders.sync(cid, foldersSyncPayload);
+                    console.log('[FolderTube AI] Successfully persisted AI folders to database via FolderTubeApi.');
+                } catch (syncErr) {
+                    console.warn('[FolderTube AI] Direct sync warning, calling syncFoldersToSupabase:', syncErr);
+                    if (typeof tm.syncFoldersToSupabase === 'function') {
+                        await tm.syncFoldersToSupabase();
+                    }
+                }
+            } else if (typeof tm.syncFoldersToSupabase === 'function') {
+                await tm.syncFoldersToSupabase();
+            }
+
+            modal.update('Completed! Updating sidebar...', 100);
+
+            setTimeout(() => {
+                modal.close();
+                try {
+                    tm._serverFolderStateLoaded = true;
+                    tm.clearUI();
+                    tm.initializeTabs();
+                    tm.initializeBadges();
+                    if (window.__yttRelocateUI) window.__yttRelocateUI();
+                    if (window.subscriptionsFolderBar?.refresh) window.subscriptionsFolderBar.refresh();
+                } catch (_) {}
+                tm.showNotification?.(`✨ Successfully organized into ${aiFolders.length} folders!`, 'success');
+            }, 500);
+
+        } catch (err) {
+            console.error('[FolderTube AI Error]:', err);
+            modal.close();
+            alert(`AI Error: ${err.message}`);
+        }
     }
 
-    const cleanFolders = autoRepairAssignments(uniqueChannels, result.folders, maxAllowed, language);
-
-    console.log(`[AI] Successfully created ${cleanFolders.length} fine-grained folders.`);
-    return res.json({ ok: true, folders: cleanFolders });
-  } catch (err) {
-    next(err);
-  }
-});
-
-export default router;
+    setInterval(createAIButton, 1500);
+})();
