@@ -14,21 +14,48 @@ const categorizeSchema = z.object({
   language: z.string().optional().default('en')
 });
 
-// قائمة النماذج الفعالة والأسرع في Google Gemini
-const ACTIVE_MODELS = [
-  'gemini-flash-lite-latest',
-  'gemini-3.6-flash',
-  'gemini-2.0-flash',
-  'gemini-1.5-flash-latest',
-  'gemini-1.5-flash'
-];
-
 function sanitizeColor(hex) {
   if (typeof hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(hex.trim())) {
     return hex.trim().toLowerCase();
   }
   const defaults = ['#3ea6ff', '#ff4d4d', '#2ecc71', '#f7d794', '#a29bfe', '#ff7675', '#00cec9', '#fdcb6e'];
   return defaults[Math.floor(Math.random() * defaults.length)];
+}
+
+// جلب النماذج النصية المفعلة والمتاحة في حساب المستخدم من Google مباشرة
+async function getActiveTextModels(apiKey) {
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+    if (res.ok) {
+      const data = await res.json();
+      const models = data?.models || [];
+      
+      const textModels = models
+        .filter(m => {
+          const name = (m.name || '').toLowerCase();
+          const methods = m.supportedGenerationMethods || [];
+          const isGenerate = methods.includes('generateContent');
+          const isExcluded = name.includes('tts') || name.includes('audio') || 
+                             name.includes('embed') || name.includes('imagen') || 
+                             name.includes('bidi') || name.includes('realtime');
+          return isGenerate && !isExcluded;
+        })
+        .map(m => m.name.replace(/^models\//, ''));
+
+      if (textModels.length > 0) {
+        // ترتيب النماذج: نماذج flash السريعة في البداية
+        textModels.sort((a, b) => {
+          const aFlash = a.includes('flash') ? -1 : 1;
+          const bFlash = b.includes('flash') ? -1 : 1;
+          return aFlash - bFlash;
+        });
+        return textModels;
+      }
+    }
+  } catch (err) {
+    console.warn('[AI] ListModels failed, using fallback list');
+  }
+  return ['gemini-flash-lite-latest', 'gemini-2.0-flash', 'gemini-2.5-flash'];
 }
 
 async function callGemini(model, apiKey, prompt) {
@@ -76,20 +103,25 @@ Return ONLY a valid JSON object matching this schema:
 
     const fullPrompt = `${systemInstruction}\n\nChannels to categorize:\n${JSON.stringify(channels)}`;
 
+    // استخراج النماذج المتاحة لمفتاح المستخدم تحديداً
+    const availableModels = await getActiveTextModels(apiKey);
+    console.log('[AI] Available models for this key:', availableModels);
+
     let geminiRes = null;
     let lastError = null;
 
-    for (const model of ACTIVE_MODELS) {
+    for (const model of availableModels) {
       try {
-        console.log(`[AI] Calling Gemini model: ${model}`);
+        console.log(`[AI] Attempting model: ${model}`);
         const response = await callGemini(model, apiKey, fullPrompt);
         if (response.ok) {
           geminiRes = response;
-          console.log(`[AI] Success with ${model}`);
+          console.log(`[AI] Successfully generated content with: ${model}`);
           break;
         }
         const errJson = await response.json().catch(() => ({}));
         lastError = errJson?.error?.message || `HTTP ${response.status}`;
+        console.warn(`[AI] Model ${model} failed (${response.status}): ${lastError}`);
       } catch (e) {
         lastError = e.message;
       }
@@ -97,7 +129,7 @@ Return ONLY a valid JSON object matching this schema:
 
     if (!geminiRes || !geminiRes.ok) {
       console.error('[AI Error from Gemini]:', lastError);
-      return res.status(400).json({ error: 'gemini_error', message: lastError || 'Gemini API call failed' });
+      return res.status(400).json({ error: 'gemini_error', message: lastError || 'All available Gemini models failed' });
     }
 
     const geminiData = await geminiRes.json();
@@ -118,6 +150,7 @@ Return ONLY a valid JSON object matching this schema:
     try {
       result = JSON.parse(rawText);
     } catch (e) {
+      console.error('[AI JSON Parse Error]:', rawText);
       return res.status(500).json({ error: 'invalid_ai_json', message: 'Failed to parse AI JSON response' });
     }
 
@@ -125,7 +158,6 @@ Return ONLY a valid JSON object matching this schema:
       return res.status(500).json({ error: 'invalid_ai_structure', message: 'AI returned invalid folder structure' });
     }
 
-    // تنقية وتصحيح الألوان والأسماء لضمان قبولها في Supabase بدون أخطاء
     const cleanFolders = result.folders.map((f, idx) => ({
       name: String(f.name || `Folder ${idx + 1}`).slice(0, 90).trim(),
       color: sanitizeColor(f.color),
