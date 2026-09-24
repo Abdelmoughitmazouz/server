@@ -22,7 +22,18 @@ function sanitizeColor(hex) {
   return defaults[Math.floor(Math.random() * defaults.length)];
 }
 
-// جلب النماذج النصية المفعلة والمتاحة في حساب المستخدم من Google مباشرة
+const PREFERRED_PRIORITY = [
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.7-flash',
+  'gemini-3.8-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-flash-lite-latest',
+  'gemini-2.0-flash',
+  'gemini-1.5-flash'
+];
+
 async function getActiveTextModels(apiKey) {
   try {
     const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
@@ -37,25 +48,28 @@ async function getActiveTextModels(apiKey) {
           const isGenerate = methods.includes('generateContent');
           const isExcluded = name.includes('tts') || name.includes('audio') || 
                              name.includes('embed') || name.includes('imagen') || 
-                             name.includes('bidi') || name.includes('realtime');
+                             name.includes('bidi') || name.includes('realtime') ||
+                             name.includes('clip') || name.includes('transcribe');
           return isGenerate && !isExcluded;
         })
         .map(m => m.name.replace(/^models\//, ''));
 
       if (textModels.length > 0) {
-        // ترتيب النماذج: نماذج flash السريعة في البداية
+        // ترتيب النماذج بحيث تأتي النماذج الموصى بها مثل 3.6-flash أولاً
         textModels.sort((a, b) => {
-          const aFlash = a.includes('flash') ? -1 : 1;
-          const bFlash = b.includes('flash') ? -1 : 1;
-          return aFlash - bFlash;
+          let idxA = PREFERRED_PRIORITY.indexOf(a);
+          let idxB = PREFERRED_PRIORITY.indexOf(b);
+          if (idxA === -1) idxA = 999;
+          if (idxB === -1) idxB = 999;
+          return idxA - idxB;
         });
         return textModels;
       }
     }
   } catch (err) {
-    console.warn('[AI] ListModels failed, using fallback list');
+    console.warn('[AI] ListModels query failed, using fallback list');
   }
-  return ['gemini-flash-lite-latest', 'gemini-2.0-flash', 'gemini-2.5-flash'];
+  return PREFERRED_PRIORITY;
 }
 
 async function callGemini(model, apiKey, prompt) {
@@ -103,9 +117,8 @@ Return ONLY a valid JSON object matching this schema:
 
     const fullPrompt = `${systemInstruction}\n\nChannels to categorize:\n${JSON.stringify(channels)}`;
 
-    // استخراج النماذج المتاحة لمفتاح المستخدم تحديداً
     const availableModels = await getActiveTextModels(apiKey);
-    console.log('[AI] Available models for this key:', availableModels);
+    console.log('[AI] Prioritized models:', availableModels.slice(0, 5));
 
     let geminiRes = null;
     let lastError = null;
@@ -116,7 +129,7 @@ Return ONLY a valid JSON object matching this schema:
         const response = await callGemini(model, apiKey, fullPrompt);
         if (response.ok) {
           geminiRes = response;
-          console.log(`[AI] Successfully generated content with: ${model}`);
+          console.log(`[AI] Successfully categorized using: ${model}`);
           break;
         }
         const errJson = await response.json().catch(() => ({}));
