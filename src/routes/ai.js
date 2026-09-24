@@ -14,9 +14,18 @@ const categorizeSchema = z.object({
   language: z.string().optional().default('en')
 });
 
+// قائمة النماذج حسب الأحدث للتجربة التلقائية
+const SUPPORTED_MODELS = [
+  'gemini-2.0-flash',
+  'gemini-2.5-flash',
+  'gemini-1.5-flash-latest',
+  'gemini-1.5-flash',
+  'gemini-pro'
+];
+
 async function callGemini(model, apiKey, prompt) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const response = await fetch(url, {
+  return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -27,7 +36,6 @@ async function callGemini(model, apiKey, prompt) {
       }
     })
   });
-  return response;
 }
 
 router.post('/categorize', async (req, res, next) => {
@@ -60,17 +68,29 @@ Return ONLY a valid JSON object matching this schema:
 
     const fullPrompt = `${systemInstruction}\n\nChannels to categorize:\n${JSON.stringify(channels)}`;
 
-    // تجربة نموذج gemini-2.5-flash ثم الرجوع لـ gemini-1.5-flash في حال عدم توفره
-    let geminiRes = await callGemini('gemini-2.5-flash', apiKey, fullPrompt);
-    if (geminiRes.status === 404) {
-      geminiRes = await callGemini('gemini-1.5-flash', apiKey, fullPrompt);
+    let geminiRes = null;
+    let lastError = null;
+
+    // محاولة تجربة النماذج المتاحة بالترتيب
+    for (const model of SUPPORTED_MODELS) {
+      try {
+        console.log(`[AI] Attempting categorization with model: ${model}`);
+        const response = await callGemini(model, apiKey, fullPrompt);
+        if (response.ok) {
+          geminiRes = response;
+          break;
+        }
+        const errJson = await response.json().catch(() => ({}));
+        lastError = errJson?.error?.message || `Status ${response.status}`;
+        console.warn(`[AI] Model ${model} returned ${response.status}: ${lastError}`);
+      } catch (e) {
+        lastError = e.message;
+      }
     }
 
-    if (!geminiRes.ok) {
-      const errData = await geminiRes.json().catch(() => ({}));
-      const msg = errData?.error?.message || `Google API error (Status ${geminiRes.status})`;
-      console.error('[AI Error from Gemini]:', geminiRes.status, errData);
-      return res.status(400).json({ error: 'gemini_error', message: msg });
+    if (!geminiRes || !geminiRes.ok) {
+      console.error('[AI Error from Gemini]:', lastError);
+      return res.status(400).json({ error: 'gemini_error', message: lastError || 'All Gemini models failed' });
     }
 
     const geminiData = await geminiRes.json();
@@ -80,7 +100,7 @@ Return ONLY a valid JSON object matching this schema:
       return res.status(500).json({ error: 'empty_ai_response', message: 'Gemini returned an empty response' });
     }
 
-    // تنظيف markdown blocks في حال أرجعها النموذج
+    // تنظيف كتل الـ Markdown (```json ... ```)
     rawText = rawText.trim();
     if (rawText.startsWith('```json')) {
       rawText = rawText.replace(/^```json\s*/, '').replace(/\s*```$/, '');

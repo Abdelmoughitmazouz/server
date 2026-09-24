@@ -12,7 +12,6 @@ import aiRouter from './routes/ai.js';
 
 const app = express();
 
-// قائمة النطاقات المسموح بها
 const allowedOrigins = [
   'https://www.folderstube.com',
   'https://folderstube.com',
@@ -36,13 +35,11 @@ const corsOptions = {
   allowedHeaders: ['Content-Type', 'Authorization', 'x-channel-id', 'x-extension-version', 'x-workspace-channel']
 };
 
-// تطبيق الـ CORS
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
 app.use(express.json({ limit: '10mb' }));
 
-// مسار فحص الحالة Health Check
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
@@ -55,7 +52,6 @@ app.use('/api/workspaces', workspacesRouter);
 app.use('/api/ai', aiRouter);
 app.use('/api/dev', devRouter);
 
-// معالج الأخطاء العام (Global Error Handler)
 app.use((err, req, res, next) => {
   console.error('[server] unhandled error', {
     method: req.method,
