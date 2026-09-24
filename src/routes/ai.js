@@ -1,221 +1,244 @@
 import express from 'express';
 import { z } from 'zod';
-import { requireAuth } from '../middleware/auth.js';
 import { supabase } from '../supabase.js';
+import { requireAuth } from '../middleware/auth.js';
 import { limitFor } from '../plans.js';
+import { getOrCreateWorkspace } from '../services/workspace.js';
 
 const router = express.Router();
-router.use(requireAuth);
 
-const categorizeSchema = z.object({
-  apiKey: z.string().min(5, 'Invalid Gemini API key'),
-  channels: z.array(z.object({
-    id: z.string(),
-    name: z.string()
-  })).min(1, 'No channels provided'),
-  language: z.string().optional().default('en')
+const channelIdSchema = z.string().regex(/^UC[\w-]{20,}$/);
+const folderIdSchema = z.string().uuid();
+const colorSchema = z.string().regex(/^#[0-9a-fA-F]{3,8}$/);
+const nameSchema = z.string().min(1).max(100);
+
+const metadataSchema = z
+  .record(z.unknown())
+  .refine((v) => JSON.stringify(v).length <= 10_000, { message: 'metadata_too_large' })
+  .default({});
+
+const folderInputSchema = z.object({
+  id: folderIdSchema,
+  name: nameSchema,
+  color: colorSchema,
+  parent_id: z.string().uuid().nullable().optional(),
+  parentId: z.string().uuid().nullable().optional(),
+  metadata: metadataSchema.optional(),
+  created_at: z.string().datetime().optional(),
 });
 
-function sanitizeColor(hex) {
-  if (typeof hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(hex.trim())) {
-    return hex.trim().toLowerCase();
-  }
-  const defaults = ['#3ea6ff', '#ff4d4d', '#2ecc71', '#f7d794', '#a29bfe', '#ff7675', '#00cec9', '#fdcb6e'];
-  return defaults[Math.floor(Math.random() * defaults.length)];
-}
+const putBodySchema = z.object({
+  channel_id: channelIdSchema,
+  folders: z.array(folderInputSchema).max(500),
+});
 
-const PREFERRED_PRIORITY = [
-  'gemini-flash-lite-latest',
-  'gemini-3.6-flash',
-  'gemini-3.5-flash-lite',
-  'gemini-3.5-flash',
-  'gemini-2.0-flash',
-  'gemini-2.5-flash-lite',
-  'gemini-1.5-flash-latest'
-];
+router.use(requireAuth);
 
-async function getActiveTextModels(apiKey) {
-  try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
-    if (res.ok) {
-      const data = await res.json();
-      const models = data?.models || [];
-      
-      const textModels = models
-        .filter(m => {
-          const name = (m.name || '').toLowerCase();
-          const methods = m.supportedGenerationMethods || [];
-          const isGenerate = methods.includes('generateContent');
-          const isExcluded = name.includes('tts') || name.includes('audio') || 
-                             name.includes('embed') || name.includes('imagen') || 
-                             name.includes('bidi') || name.includes('realtime') ||
-                             name.includes('clip') || name.includes('transcribe');
-          return isGenerate && !isExcluded;
+// دالة ذكية لإيجاد أو تحديث مساحة العمل لتفادي خطأ workspace_limit_reached
+async function resolveWorkspace(userId, channelId) {
+  // 1. جلب بيانات وخطة المستخدم
+  const { data: userProfile } = await supabase
+    .from('users')
+    .select('plan, primary_channel_id, allowed_channels')
+    .eq('id', userId)
+    .maybeSingle();
+
+  const plan = userProfile?.plan || 'free';
+  const { workspaces: wsLimit } = limitFor(plan);
+
+  // 2. البحث عن مساحة عمل موجودة بنفس القناة
+  const { data: existingWs } = await supabase
+    .from('workspaces')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('channel_id', channelId)
+    .maybeSingle();
+
+  if (existingWs) return existingWs;
+
+  // 3. إذا كان المستخدم في الخطة المجانية ولديه مساحة عمل سابقة لقناة أخرى، نحدثها للقناة الحالية
+  if (wsLimit === 1) {
+    const { data: anyWs } = await supabase
+      .from('workspaces')
+      .select('*')
+      .eq('user_id', userId)
+      .limit(1)
+      .maybeSingle();
+
+    if (anyWs) {
+      const { data: updatedWs } = await supabase
+        .from('workspaces')
+        .update({
+          channel_id: channelId,
+          workspace_channel_id: channelId,
+          updated_at: new Date().toISOString()
         })
-        .map(m => m.name.replace(/^models\//, ''));
+        .eq('id', anyWs.id)
+        .select()
+        .single();
 
-      if (textModels.length > 0) {
-        textModels.sort((a, b) => {
-          let idxA = PREFERRED_PRIORITY.indexOf(a);
-          let idxB = PREFERRED_PRIORITY.indexOf(b);
-          if (idxA === -1) idxA = 999;
-          if (idxB === -1) idxB = 999;
-          return idxA - idxB;
-        });
-        return textModels;
-      }
+      if (updatedWs) return updatedWs;
     }
-  } catch (err) {
-    console.warn('[AI] ListModels query failed, using fallback list');
   }
-  return PREFERRED_PRIORITY;
+
+  // 4. إنشاء مساحة عمل جديدة إذا لم تكن الحدود قد اكتملت
+  return getOrCreateWorkspace(userId, channelId);
 }
 
-async function callGemini(model, apiKey, prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  return fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0.2
-      }
-    })
-  });
-}
-
-router.post('/categorize', async (req, res, next) => {
+// GET /api/folders
+router.get('/', async (req, res, next) => {
   try {
-    const parsed = categorizeSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'bad_request', message: 'Invalid request data', detail: parsed.error.issues });
+    const channelId = req.headers['x-workspace-channel'] || req.query.channel_id;
+    if (!channelId) return res.status(400).json({ error: 'missing_channel_id' });
+    if (!channelIdSchema.safeParse(channelId).success) {
+      return res.status(400).json({ error: 'bad_channel_id' });
     }
 
-    const { apiKey, channels, language } = parsed.data;
-    const userId = req.user.user_id || req.user.id || req.user.sub;
-
-    // 1. معرفة خطة المستخدم والحد الأقصى المسموح به للمجلدات
-    let plan = 'free';
+    const userId = req.user.user_id || req.user.id;
+    let workspace;
     try {
-      const { data: userProfile } = await supabase
-        .from('users')
-        .select('plan')
-        .eq('id', userId)
-        .maybeSingle();
-      plan = userProfile?.plan || req.user.plan || 'free';
-    } catch (_) {}
-
-    const { folders_per_workspace: folderLimit } = limitFor(plan);
-    const maxAllowed = Number.isFinite(folderLimit) ? folderLimit : 10;
-
-    console.log(`[AI] Categorizing for user ${userId} (Plan: ${plan}, Max Folders: ${maxAllowed})`);
-
-    // 2. توجيه الذكاء الاصطناعي لإنشاء عدد مجلدات مناسب لخطة المستخدم
-    const folderCountInstruction = maxAllowed <= 3
-      ? `IMPORTANT: You MUST create at most ${maxAllowed} broad, high-level categories (e.g., "Tech & Education", "Entertainment & Gaming", "Music & Lifestyle") to stay within the allowed limit of ${maxAllowed} folders.`
-      : `Create between 4 and ${maxAllowed} logical categories (e.g., "Tech & Programming", "Gaming", "Music", "Education", "Sports", "News & Politics", "Entertainment", "Lifestyle").`;
-
-    const systemInstruction = `
-You are an expert YouTube subscription organizer.
-Analyze the following list of YouTube channels and categorize them logically.
-${folderCountInstruction}
-- Write folder names in the requested language: "${language}".
-- Assign a distinct HEX color for each folder (e.g. #3ea6ff, #ff4d4d, #2ecc71, #f7d794, #a29bfe, #ff7675, #00cec9, #fdcb6e).
-- Every channel provided MUST be assigned to exactly one folder.
-
-Return ONLY a valid JSON object matching this schema:
-{
-  "folders": [
-    {
-      "name": "Folder Name",
-      "color": "#HEX_COLOR",
-      "channelIds": ["UCxxxx", "UCyyyy"]
+      workspace = await resolveWorkspace(userId, channelId);
+    } catch (e) {
+      if (e.reason === 'workspace_limit_reached' || e.message === 'workspace_limit_reached') {
+        return res.status(403).json({ error: 'channel_not_linked', reason: 'workspace_limit_reached' });
+      }
+      throw e;
     }
-  ]
-}
-`;
 
-    const fullPrompt = `${systemInstruction}\n\nChannels to categorize:\n${JSON.stringify(channels)}`;
+    const { data, error } = await supabase
+      .from('folders')
+      .select('id, name, color, parent_id, workspace_id, channel_id, workspace_channel_id, metadata, created_at')
+      .eq('workspace_id', workspace.id);
 
-    const availableModels = await getActiveTextModels(apiKey);
-    let geminiRes = null;
-    let lastError = null;
+    if (error) {
+      console.error('[folders] fetch failed', error);
+      return res.status(500).json({ error: 'folders_fetch_failed' });
+    }
 
-    for (const model of availableModels) {
-      try {
-        console.log(`[AI] Attempting model: ${model}`);
-        const response = await callGemini(model, apiKey, fullPrompt);
-        if (response.ok) {
-          geminiRes = response;
-          console.log(`[AI] Successfully categorized using: ${model}`);
-          break;
+    return res.json({ folders: Array.isArray(data) ? data : [], workspace_id: workspace.id });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// PUT /api/folders
+router.put('/', async (req, res, next) => {
+  try {
+    const parsed = putBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'bad_request', detail: parsed.error.issues });
+    }
+    const { channel_id, folders } = parsed.data;
+    const userId = req.user.user_id || req.user.id;
+
+    let workspace;
+    try {
+      workspace = await resolveWorkspace(userId, channel_id);
+    } catch (e) {
+      if (e.reason === 'workspace_limit_reached' || e.message === 'workspace_limit_reached') {
+        return res.status(403).json({ error: 'channel_not_linked', reason: 'workspace_limit_reached' });
+      }
+      throw e;
+    }
+
+    const { data: userProfile } = await supabase
+      .from('users')
+      .select('plan')
+      .eq('id', userId)
+      .maybeSingle();
+
+    const plan = userProfile?.plan || 'free';
+    const { folders_per_workspace: limit } = limitFor(plan);
+
+    if (folders.length > limit) {
+      return res.status(403).json({
+        error: 'folder_limit_exceeded',
+        plan,
+        limit,
+        attempted: folders.length,
+      });
+    }
+
+    const rows = folders.map((f) => ({
+      id: f.id,
+      name: f.name,
+      color: f.color,
+      parent_id: f.parent_id || f.parentId || null,
+      workspace_id: String(workspace.id),
+      channel_id: channel_id,
+      workspace_channel_id: channel_id,
+      user_id: userId,
+      metadata: {
+        ...(f.metadata || {}),
+        parentId: f.parent_id || f.parentId || null,
+      },
+      ...(f.created_at ? { created_at: f.created_at } : {}),
+    }));
+
+    if (rows.length > 0) {
+      const { data: applied, error: upsertErr } = await supabase
+        .from('folders')
+        .upsert(rows, { onConflict: 'id' })
+        .select('id, name, color, parent_id, workspace_id, channel_id, metadata, created_at');
+
+      if (upsertErr) {
+        if (upsertErr.message?.includes('folder_limit_exceeded')) {
+          return res.status(403).json({ error: 'folder_limit_exceeded' });
         }
-        const errJson = await response.json().catch(() => ({}));
-        lastError = errJson?.error?.message || `HTTP ${response.status}`;
-        console.warn(`[AI] Model ${model} failed (${response.status}): ${lastError}`);
-      } catch (e) {
-        lastError = e.message;
+        console.error('[folders] upsert failed', upsertErr);
+        return res.status(500).json({ error: 'folders_upsert_failed' });
       }
     }
 
-    if (!geminiRes || !geminiRes.ok) {
-      console.error('[AI Error from Gemini]:', lastError);
-      return res.status(400).json({ error: 'gemini_error', message: lastError || 'All available Gemini models failed' });
+    let deleted_ids = [];
+    const localIds = rows.map((r) => r.id);
+    let delQ = supabase
+      .from('folders')
+      .delete()
+      .eq('workspace_id', String(workspace.id));
+
+    if (localIds.length > 0) {
+      delQ = delQ.not('id', 'in', `(${localIds.join(',')})`);
     }
 
-    const geminiData = await geminiRes.json();
-    let rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!rawText) {
-      return res.status(500).json({ error: 'empty_ai_response', message: 'Gemini returned an empty response' });
+    const { data: delData, error: delErr } = await delQ.select('id');
+    if (delErr) {
+      console.error('[folders] cleanup failed', delErr);
+    } else {
+      deleted_ids = (delData || []).map((r) => r.id);
     }
 
-    rawText = rawText.trim();
-    if (rawText.startsWith('```json')) {
-      rawText = rawText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-    } else if (rawText.startsWith('```')) {
-      rawText = rawText.replace(/^```\s*/, '').replace(/\s*```$/, '');
+    console.log(`[folders] Successfully synced ${rows.length} folder(s) for workspace ${workspace.id}`);
+    res.json({ folders: rows, deleted_ids, workspace_id: workspace.id });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// DELETE /api/folders/:id
+router.delete('/:id', async (req, res, next) => {
+  try {
+    const parsed = folderIdSchema.safeParse(req.params.id);
+    if (!parsed.success) return res.status(400).json({ error: 'bad_id' });
+
+    const userId = req.user.user_id || req.user.id;
+
+    const { data, error } = await supabase
+      .from('folders')
+      .delete()
+      .eq('id', parsed.data)
+      .eq('user_id', userId)
+      .select('id');
+
+    if (error) {
+      console.error('[folders] delete failed', error);
+      return res.status(500).json({ error: 'folder_delete_failed' });
     }
+    if (!data || data.length === 0) return res.status(404).json({ error: 'not_found' });
 
-    let result;
-    try {
-      result = JSON.parse(rawText);
-    } catch (e) {
-      console.error('[AI JSON Parse Error]:', rawText);
-      return res.status(500).json({ error: 'invalid_ai_json', message: 'Failed to parse AI JSON response' });
-    }
-
-    if (!result?.folders || !Array.isArray(result.folders)) {
-      return res.status(500).json({ error: 'invalid_ai_structure', message: 'AI returned invalid folder structure' });
-    }
-
-    let cleanFolders = result.folders.map((f, idx) => ({
-      name: String(f.name || `Folder ${idx + 1}`).slice(0, 90).trim(),
-      color: sanitizeColor(f.color),
-      channelIds: Array.isArray(f.channelIds) ? f.channelIds.filter(id => typeof id === 'string' && /^UC[\w-]{20,}$/.test(id)) : []
-    })).filter(f => f.name.length > 0 && f.channelIds.length > 0);
-
-    // 3. ضمان برمجي قاطع: دمج أي مجلدات زائدة لكي لا تتجاوز الحد المسموح للخطة
-    if (cleanFolders.length > maxAllowed) {
-      console.log(`[AI] Truncating & merging folders to fit plan limit (${cleanFolders.length} -> ${maxAllowed})`);
-      const kept = cleanFolders.slice(0, maxAllowed - 1);
-      const remaining = cleanFolders.slice(maxAllowed - 1);
-      const mergedChannels = [...new Set(remaining.flatMap(f => f.channelIds))];
-      
-      const otherLabel = language.startsWith('ar') ? 'منوعات وقنوات أخرى' : 'General & Other';
-      kept.push({
-        name: otherLabel,
-        color: '#a29bfe',
-        channelIds: mergedChannels
-      });
-      cleanFolders = kept;
-    }
-
-    return res.json({ ok: true, folders: cleanFolders });
-  } catch (err) {
-    next(err);
+    res.status(204).end();
+  } catch (e) {
+    next(e);
   }
 });
 
