@@ -14,42 +14,40 @@ const categorizeSchema = z.object({
   language: z.string().optional().default('en')
 });
 
-// دالة لجلب أسماء النماذج المتاحة لمفتاح المستخدم تلقائياً من Google
-async function getAvailableModel(apiKey) {
-  try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
-    if (res.ok) {
-      const data = await res.json();
-      const models = data?.models || [];
-      // البحث عن نموذج يدعم generateContent ويفضل flash
-      const preferred = models.find(m => 
-        m.supportedGenerationMethods?.includes('generateContent') && 
-        (m.name.includes('flash') || m.name.includes('2.5') || m.name.includes('2.0') || m.name.includes('1.5'))
-      ) || models.find(m => m.supportedGenerationMethods?.includes('generateContent'));
-
-      if (preferred?.name) {
-        return preferred.name.replace(/^models\//, '');
+// استعلام تلقائي من Google لجلب النماذج المتاحة لهذا المفتاح
+async function discoverModels(apiKey) {
+  for (const ver of ['v1beta', 'v1']) {
+    try {
+      const res = await fetch(`https://generativelanguage.googleapis.com/${ver}/models?key=${apiKey}`);
+      if (res.ok) {
+        const data = await res.json();
+        const models = (data?.models || [])
+          .filter(m => m.supportedGenerationMethods?.includes('generateContent'))
+          .map(m => ({
+            name: m.name.replace(/^models\//, ''),
+            version: ver
+          }));
+        if (models.length > 0) return models;
       }
-    }
-  } catch (err) {
-    console.warn('[AI] Could not auto-detect model from Google, using fallback list');
+    } catch (_) {}
   }
-  return null;
+  return [];
 }
 
-// قائمة بدائل في حال عدم استجابة الاستعلام
-const FALLBACK_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
-  'gemini-1.5-flash-latest',
-  'gemini-1.5-flash',
-  'gemini-1.5-flash-8b',
-  'gemini-1.5-pro',
-  'gemini-pro'
+const FALLBACK_CANDIDATES = [
+  { name: 'gemini-2.0-flash', version: 'v1beta' },
+  { name: 'gemini-2.5-flash', version: 'v1beta' },
+  { name: 'gemini-1.5-flash-latest', version: 'v1beta' },
+  { name: 'gemini-1.5-flash', version: 'v1' },
+  { name: 'gemini-1.5-flash', version: 'v1beta' },
+  { name: 'gemini-1.5-flash-001', version: 'v1beta' },
+  { name: 'gemini-1.5-flash-002', version: 'v1beta' },
+  { name: 'gemini-1.5-pro', version: 'v1beta' },
+  { name: 'gemini-pro', version: 'v1' }
 ];
 
-async function callGemini(model, apiKey, prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+async function callGemini(version, model, apiKey, prompt) {
+  const url = `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${apiKey}`;
   return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -93,26 +91,25 @@ Return ONLY a valid JSON object matching this schema:
 
     const fullPrompt = `${systemInstruction}\n\nChannels to categorize:\n${JSON.stringify(channels)}`;
 
-    // 1. محاولة معرفة النموذج المتاح في حساب المستخدم
-    let activeModel = await getAvailableModel(apiKey);
-    let modelsToTry = activeModel ? [activeModel, ...FALLBACK_MODELS] : FALLBACK_MODELS;
-    modelsToTry = [...new Set(modelsToTry)]; // إزالة التكرار
+    // 1. اكتشاف النماذج المتاحة من حساب Google
+    const discovered = await discoverModels(apiKey);
+    const modelsToTry = discovered.length > 0 ? discovered : FALLBACK_CANDIDATES;
 
     let geminiRes = null;
     let lastError = null;
 
-    for (const model of modelsToTry) {
+    for (const item of modelsToTry) {
       try {
-        console.log(`[AI] Calling Gemini model: ${model}`);
-        const response = await callGemini(model, apiKey, fullPrompt);
+        console.log(`[AI] Attempting ${item.version}/models/${item.name}`);
+        const response = await callGemini(item.version, item.name, apiKey, fullPrompt);
         if (response.ok) {
           geminiRes = response;
-          console.log(`[AI] Success with model: ${model}`);
+          console.log(`[AI] Success with ${item.version}/models/${item.name}`);
           break;
         }
         const errJson = await response.json().catch(() => ({}));
         lastError = errJson?.error?.message || `HTTP ${response.status}`;
-        console.warn(`[AI] Model ${model} failed (${response.status}): ${lastError}`);
+        console.warn(`[AI] ${item.name} failed: ${lastError}`);
       } catch (e) {
         lastError = e.message;
       }
@@ -120,7 +117,7 @@ Return ONLY a valid JSON object matching this schema:
 
     if (!geminiRes || !geminiRes.ok) {
       console.error('[AI Error from Gemini]:', lastError);
-      return res.status(400).json({ error: 'gemini_error', message: lastError || 'Failed to connect to Gemini API' });
+      return res.status(400).json({ error: 'gemini_error', message: lastError || 'All Gemini models failed' });
     }
 
     const geminiData = await geminiRes.json();
@@ -130,7 +127,6 @@ Return ONLY a valid JSON object matching this schema:
       return res.status(500).json({ error: 'empty_ai_response', message: 'Gemini returned an empty response' });
     }
 
-    // تنظيف كتل الـ Markdown (```json ... ```)
     rawText = rawText.trim();
     if (rawText.startsWith('```json')) {
       rawText = rawText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
@@ -142,7 +138,6 @@ Return ONLY a valid JSON object matching this schema:
     try {
       result = JSON.parse(rawText);
     } catch (e) {
-      console.error('[AI JSON Parse Error]:', rawText);
       return res.status(500).json({ error: 'invalid_ai_json', message: 'Failed to parse AI JSON response' });
     }
 
