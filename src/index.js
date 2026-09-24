@@ -1,6 +1,10 @@
 import express from 'express';
 import cors from 'cors';
 import { config } from './config.js';
+import aiRouter from './routes/ai.js';
+
+// ... مع باقي المسارات:
+app.use('/api/ai', aiRouter);
 
 // استيراد كافة المسارات
 import authRouter from './routes/auth.js';
