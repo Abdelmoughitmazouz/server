@@ -14,48 +14,55 @@ const categorizeSchema = z.object({
   language: z.string().optional().default('en')
 });
 
-// استعلام تلقائي من Google لجلب النماذج المتاحة لهذا المفتاح
-async function discoverModels(apiKey) {
-  for (const ver of ['v1beta', 'v1']) {
-    try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/${ver}/models?key=${apiKey}`);
-      if (res.ok) {
-        const data = await res.json();
-        const models = (data?.models || [])
-          .filter(m => m.supportedGenerationMethods?.includes('generateContent'))
-          .map(m => ({
-            name: m.name.replace(/^models\//, ''),
-            version: ver
-          }));
-        if (models.length > 0) return models;
-      }
-    } catch (_) {}
-  }
-  return [];
-}
-
-const FALLBACK_CANDIDATES = [
-  { name: 'gemini-2.0-flash', version: 'v1beta' },
-  { name: 'gemini-2.5-flash', version: 'v1beta' },
-  { name: 'gemini-1.5-flash-latest', version: 'v1beta' },
-  { name: 'gemini-1.5-flash', version: 'v1' },
-  { name: 'gemini-1.5-flash', version: 'v1beta' },
-  { name: 'gemini-1.5-flash-001', version: 'v1beta' },
-  { name: 'gemini-1.5-flash-002', version: 'v1beta' },
-  { name: 'gemini-1.5-pro', version: 'v1beta' },
-  { name: 'gemini-pro', version: 'v1' }
+// قائمة النماذج النصية الحديثة والمتوافقة مع Google Gemini API
+const SUPPORTED_MODELS = [
+  'gemini-3.6-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-pro-preview',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-1.5-flash-latest',
+  'gemini-1.5-flash'
 ];
 
-async function callGemini(version, model, apiKey, prompt) {
-  const url = `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${apiKey}`;
+// دالة لاكتشاف النماذج النصية المفعلة في مفتاح المستخدم مع استبعاد نماذج الصوت/TTS
+async function getAvailableTextModel(apiKey) {
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+    if (res.ok) {
+      const data = await res.json();
+      const models = data?.models || [];
+
+      // استبعاد نماذج الصوت والتضمين وتحديد النماذج النصية فقط
+      const textModels = models.filter(m => {
+        const name = m.name.toLowerCase();
+        const isSupportedMethod = m.supportedGenerationMethods?.includes('generateContent');
+        const isExcluded = name.includes('tts') || name.includes('audio') || name.includes('embedding') || name.includes('bidi');
+        return isSupportedMethod && !isExcluded;
+      });
+
+      // تفضيل نماذج flash الحديثة
+      const preferred = textModels.find(m => m.name.includes('3.6') || m.name.includes('3.5')) ||
+                        textModels.find(m => m.name.includes('flash')) ||
+                        textModels[0];
+
+      if (preferred?.name) {
+        return preferred.name.replace(/^models\//, '');
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function callGemini(model, apiKey, prompt) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0.2
+        responseMimeType: 'application/json'
       }
     })
   });
@@ -91,25 +98,25 @@ Return ONLY a valid JSON object matching this schema:
 
     const fullPrompt = `${systemInstruction}\n\nChannels to categorize:\n${JSON.stringify(channels)}`;
 
-    // 1. اكتشاف النماذج المتاحة من حساب Google
-    const discovered = await discoverModels(apiKey);
-    const modelsToTry = discovered.length > 0 ? discovered : FALLBACK_CANDIDATES;
+    // 1. استعلام واكتشاف النموذج النصي النشط لمفتاح المستخدم
+    const activeModel = await getAvailableTextModel(apiKey);
+    const modelsToTry = [...new Set(activeModel ? [activeModel, ...SUPPORTED_MODELS] : SUPPORTED_MODELS)];
 
     let geminiRes = null;
     let lastError = null;
 
-    for (const item of modelsToTry) {
+    for (const model of modelsToTry) {
       try {
-        console.log(`[AI] Attempting ${item.version}/models/${item.name}`);
-        const response = await callGemini(item.version, item.name, apiKey, fullPrompt);
+        console.log(`[AI] Calling Gemini model: ${model}`);
+        const response = await callGemini(model, apiKey, fullPrompt);
         if (response.ok) {
           geminiRes = response;
-          console.log(`[AI] Success with ${item.version}/models/${item.name}`);
+          console.log(`[AI] Successfully categorized using model: ${model}`);
           break;
         }
         const errJson = await response.json().catch(() => ({}));
         lastError = errJson?.error?.message || `HTTP ${response.status}`;
-        console.warn(`[AI] ${item.name} failed: ${lastError}`);
+        console.warn(`[AI] Model ${model} failed (${response.status}): ${lastError}`);
       } catch (e) {
         lastError = e.message;
       }
@@ -117,7 +124,7 @@ Return ONLY a valid JSON object matching this schema:
 
     if (!geminiRes || !geminiRes.ok) {
       console.error('[AI Error from Gemini]:', lastError);
-      return res.status(400).json({ error: 'gemini_error', message: lastError || 'All Gemini models failed' });
+      return res.status(400).json({ error: 'gemini_error', message: lastError || 'Gemini API call failed' });
     }
 
     const geminiData = await geminiRes.json();
@@ -127,6 +134,7 @@ Return ONLY a valid JSON object matching this schema:
       return res.status(500).json({ error: 'empty_ai_response', message: 'Gemini returned an empty response' });
     }
 
+    // تنظيف علامات الـ Markdown إن وُجدت
     rawText = rawText.trim();
     if (rawText.startsWith('```json')) {
       rawText = rawText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
@@ -138,6 +146,7 @@ Return ONLY a valid JSON object matching this schema:
     try {
       result = JSON.parse(rawText);
     } catch (e) {
+      console.error('[AI JSON Parse Error]:', rawText);
       return res.status(500).json({ error: 'invalid_ai_json', message: 'Failed to parse AI JSON response' });
     }
 
