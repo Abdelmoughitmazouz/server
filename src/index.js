@@ -11,6 +11,7 @@ import workspacesRouter from './routes/workspaces.js';
 import aiRouter from './routes/ai.js';
 import feedRouter from './routes/feed.js';
 import i18nRouter from './routes/i18n.js';
+import backupRouter from './routes/backup.js';
 
 const app = express();
 
@@ -55,6 +56,7 @@ app.use('/api/ai', aiRouter);
 app.use('/api/dev', devRouter);
 app.use('/api/feed', feedRouter);
 app.use('/api/i18n', i18nRouter);
+app.use('/api/backup', backupRouter);
 
 
 app.use((err, req, res, next) => {
