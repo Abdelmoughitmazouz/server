@@ -9,6 +9,7 @@ import foldersRouter from './routes/folders.js';
 import meRouter from './routes/me.js';
 import workspacesRouter from './routes/workspaces.js';
 import aiRouter from './routes/ai.js';
+import feedRouter from './routes/feed.js';
 
 const app = express();
 
@@ -51,6 +52,7 @@ app.use('/api/folders', foldersRouter);
 app.use('/api/workspaces', workspacesRouter);
 app.use('/api/ai', aiRouter);
 app.use('/api/dev', devRouter);
+app.use('/api/feed', feedRouter);
 
 app.use((err, req, res, next) => {
   console.error('[server] unhandled error', {
